@@ -507,6 +507,27 @@ button.source-link {
   color: var(--pine-2);
 }
 
+.portfolio-limit-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  max-width: 980px;
+  margin-top: 10px;
+  border: 1px solid rgba(177, 81, 0, 0.26);
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: #703800;
+  background: rgba(233, 120, 27, 0.09);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.portfolio-limit-warning svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--amber);
+}
+
 .portfolio-visual {
   width: 100%;
   max-width: 1180px;
@@ -550,11 +571,16 @@ button.source-link {
 
 .portfolio-row {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) 128px 68px 42px;
+  grid-template-columns: minmax(220px, 1fr) 128px 112px 68px 42px;
   align-items: center;
   gap: 8px;
   border-bottom: 1px solid #e7eeeb;
   padding: 8px 0;
+}
+
+.portfolio-row.limit-warn,
+.portfolio-row.limit-blocked {
+  border-bottom-color: rgba(233, 120, 27, 0.22);
 }
 
 .portfolio-row.header {
@@ -583,6 +609,30 @@ button.source-link {
   font-family: var(--data-font);
   font-size: 12px;
   text-align: right;
+}
+
+.purchase-limit-pill {
+  justify-self: start;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 8px;
+  color: #50615b;
+  background: #ffffff;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.purchase-limit-pill.warn {
+  border-color: rgba(233, 120, 27, 0.34);
+  color: #944800;
+  background: rgba(233, 120, 27, 0.08);
+}
+
+.purchase-limit-pill.blocked {
+  border-color: rgba(178, 47, 44, 0.34);
+  color: #9b1f1d;
+  background: rgba(178, 47, 44, 0.08);
 }
 
 .portfolio-warning {
@@ -1797,7 +1847,7 @@ tbody tr:last-child td {
 
   .portfolio-row,
   .portfolio-row.header {
-    grid-template-columns: minmax(0, 1fr) 112px 58px 38px;
+    grid-template-columns: minmax(0, 1fr) 112px 92px 58px 38px;
   }
 }
 
@@ -1829,7 +1879,7 @@ tbody tr:last-child td {
   }
 
   .portfolio-row {
-    grid-template-columns: minmax(0, 1fr) 84px 38px;
+    grid-template-columns: minmax(0, 1fr) 90px 64px 38px;
     gap: 7px;
   }
 
@@ -1843,6 +1893,15 @@ tbody tr:last-child td {
 
   .portfolio-row strong {
     text-align: left;
+  }
+
+  .purchase-limit-pill {
+    justify-self: stretch;
+    overflow: hidden;
+    padding-right: 6px;
+    padding-left: 6px;
+    text-align: center;
+    text-overflow: ellipsis;
   }
 
   .target-holding-list {

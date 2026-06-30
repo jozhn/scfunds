@@ -49,16 +49,16 @@ const PERFORMANCE_CARD_PERIODS = [
 ]
 const DEFAULT_PORTFOLIO_TOTAL = 500000
 const DEFAULT_PORTFOLIO_ROWS = [
-  { token: '016664', amount: 80000 },
-  { token: '270023', amount: 70000 },
-  { token: '016452', amount: 40000 },
-  { token: '007280', amount: 25000 },
-  { token: '002610', amount: 50000 },
-  { token: '001219', amount: 50000 },
-  { token: '016633', amount: 25000 },
-  { token: '007490', amount: 75000 },
-  { token: '020628', amount: 55000 },
-  { token: '050022', amount: 30000 },
+  { token: '020628', amount: 80000 },
+  { token: '017469', amount: 70000 },
+  { token: '050022', amount: 65000 },
+  { token: '202027', amount: 60000 },
+  { token: '012650', amount: 55000 },
+  { token: '013298', amount: 50000 },
+  { token: '377240', amount: 45000 },
+  { token: '470009', amount: 40000 },
+  { token: '016633', amount: 20000 },
+  { token: '002610', amount: 15000 },
 ]
 
 function unpackHistory(history = []) {
@@ -1047,6 +1047,58 @@ function currencyAmount(value) {
   return value.toLocaleString('zh-CN', { maximumFractionDigits: 0 })
 }
 
+function fundShortCode(fund) {
+  return fund?.name?.match(/\d{6}/)?.[0] || fund?.isin || fund?.name || '-'
+}
+
+function purchaseLimitLabel(fund) {
+  const limit = fund?.purchaseLimit
+  if (!limit?.source) return '-'
+  if (limit.suspended) return limit.purchaseStatus || '暂停申购'
+  if (Number.isFinite(limit.maxPurchaseAmount)) return `限 ${currencyAmount(limit.maxPurchaseAmount)}元/日`
+  return limit.purchaseStatus || '开放申购'
+}
+
+function purchaseLimitTone(fund, amount) {
+  const limit = fund?.purchaseLimit
+  const value = Number(amount)
+  if (!limit?.source) return ''
+  if (limit.suspended) return 'blocked'
+  if (Number.isFinite(limit.maxPurchaseAmount) && Number.isFinite(value) && value > limit.maxPurchaseAmount) {
+    return 'warn'
+  }
+  return ''
+}
+
+function purchaseLimitIssue(fund, amount) {
+  const limit = fund?.purchaseLimit
+  const value = Number(amount)
+  if (!fund || !limit?.source || !Number.isFinite(value) || value <= 0) return null
+
+  if (limit.suspended) {
+    return {
+      type: 'blocked',
+      summary: `${fundShortCode(fund)} 当前${limit.purchaseStatus || '暂停申购'}`,
+    }
+  }
+
+  if (Number.isFinite(limit.maxPurchaseAmount) && value > limit.maxPurchaseAmount) {
+    const days = Math.ceil(value / limit.maxPurchaseAmount)
+    return {
+      type: 'limited',
+      summary: `${fundShortCode(fund)} 限 ${currencyAmount(limit.maxPurchaseAmount)}元/日，计划 ${currencyAmount(value)} 元，约需 ${days} 天`,
+    }
+  }
+
+  return null
+}
+
+function portfolioLimitSummary(issues) {
+  if (!issues.length) return ''
+  const preview = issues.slice(0, 4).map((issue) => issue.summary).join('；')
+  return `当前组合有 ${issues.length} 项可能无法按计划一次买入：${preview}${issues.length > 4 ? ' 等' : ''}。`
+}
+
 function PortfolioChartTooltip({ point, width }) {
   if (!point) return null
 
@@ -1141,6 +1193,9 @@ function PortfolioBuilder({ data, onOpenFund }) {
   const totalInputAmount = rows.reduce((sum, row) => sum + (Number(row.amount) || 0), 0)
   const analysisDays = daysBetween(analysis.startDate, analysis.endDate)
   const isCompactRange = Number.isFinite(analysisDays) && analysisDays < 270
+  const purchaseLimitIssues = rows
+    .map((row) => purchaseLimitIssue(fundsById.get(row.fundId), row.amount))
+    .filter(Boolean)
 
   useEffect(() => {
     if (!funds.length || rows.length) return
@@ -1175,7 +1230,7 @@ function PortfolioBuilder({ data, onOpenFund }) {
         <div>
           <p className="eyebrow">自定义配置组合</p>
           <h2>组合回测</h2>
-          <p>金额按含申购费扣款处理，曲线使用人民币视角历史净值；默认组合仅选 50 万代销公募配置。</p>
+          <p>金额按含申购费扣款处理，曲线使用人民币视角历史净值；默认组合仅选代销公募，并避开暂停申购或低日限购产品。</p>
         </div>
         <div className="portfolio-actions">
           <label className="date-control">
@@ -1200,6 +1255,13 @@ function PortfolioBuilder({ data, onOpenFund }) {
         </span>
       </div>
 
+      {purchaseLimitIssues.length ? (
+        <div className="portfolio-limit-warning">
+          <AlertTriangle size={16} />
+          <span>{portfolioLimitSummary(purchaseLimitIssues)}</span>
+        </div>
+      ) : null}
+
       <div className={isCompactRange ? 'portfolio-visual compact' : 'portfolio-visual'}>
         <div className="portfolio-metrics">
           <MetricPill icon={PieChart} label="配置金额" value={`${currencyAmount(totalInputAmount)}元`} />
@@ -1217,18 +1279,20 @@ function PortfolioBuilder({ data, onOpenFund }) {
         <div className="portfolio-editor">
           <div className="card-title-row">
             <h3>配置明细</h3>
-            <span>默认 {currencyAmount(DEFAULT_PORTFOLIO_TOTAL)} 元代销公募，可直接改金额和基金</span>
+            <span>默认 {currencyAmount(DEFAULT_PORTFOLIO_TOTAL)} 元代销公募，限购提示来自天天基金</span>
           </div>
           <div className="portfolio-row header">
             <span>基金</span>
             <span>买入金额</span>
+            <span>限购</span>
             <span>费率</span>
             <span>操作</span>
           </div>
           {rows.map((row) => {
             const fund = fundsById.get(row.fundId)
+            const limitTone = purchaseLimitTone(fund, row.amount)
             return (
-              <div className="portfolio-row" key={row.id}>
+              <div className={`portfolio-row ${limitTone ? `limit-${limitTone}` : ''}`} key={row.id}>
                 <select value={row.fundId} onChange={(event) => updateRow(row.id, { fundId: event.target.value })}>
                   {fundOptions.map((option) => (
                     <option key={option.id} value={option.id}>
@@ -1243,6 +1307,7 @@ function PortfolioBuilder({ data, onOpenFund }) {
                   value={row.amount}
                   onChange={(event) => updateRow(row.id, { amount: event.target.value })}
                 />
+                <span className={`purchase-limit-pill ${limitTone}`}>{purchaseLimitLabel(fund)}</span>
                 <strong>{formatFeeRate(effectiveFeeRate(fund || {}))}</strong>
                 <button className="icon-button" type="button" onClick={() => removeRow(row.id)} title="删除">
                   <Trash2 size={15} />
@@ -1479,6 +1544,7 @@ function FundDrawer({ fund, onClose }) {
       ? cnyMetric.totalReturn - localMetric.totalReturn
       : null
   const purchaseFee = fund.purchaseFee || {}
+  const purchaseLimit = fund.purchaseLimit || {}
   const dailyReturn = latestDailyReturn(navHistory)
 
   useEffect(() => {
@@ -1618,6 +1684,12 @@ function FundDrawer({ fund, onClose }) {
                   <a href={purchaseFee.discountUrl} target="_blank" rel="noreferrer">{purchaseFee.discountTitle || '查看公告'}</a>
                 ) : '-'}
               </dd>
+              <dt>申购状态</dt>
+              <dd>{purchaseLimit.purchaseStatus || '-'}</dd>
+              <dt>单日上限</dt>
+              <dd>{Number.isFinite(purchaseLimit.maxPurchaseAmount) ? `${currencyAmount(purchaseLimit.maxPurchaseAmount)} 元` : '-'}</dd>
+              <dt>最低申购</dt>
+              <dd>{Number.isFinite(purchaseLimit.minPurchaseAmount) ? `${currencyAmount(purchaseLimit.minPurchaseAmount)} 元` : '-'}</dd>
               <dt>本区间回本日期</dt>
               <dd>{metric?.feeBreakEvenDate || '-'}</dd>
               <dt>滚动回本成功率</dt>

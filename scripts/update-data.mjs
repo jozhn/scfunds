@@ -647,6 +647,41 @@ function parseDanjuanPurchaseFee(fundInfo) {
   }
 }
 
+function parseTradeAmount(value) {
+  if (value === null || value === undefined) return null
+  const normalized = String(value).replace(/[,，\s元]/g, '')
+  if (!normalized || normalized === '--') return null
+
+  const amount = Number(normalized)
+  return Number.isFinite(amount) ? amount : null
+}
+
+function parseTiantianPurchaseLimit(payload) {
+  const data = payload?.JJXQ?.Datas || {}
+  const maxPurchaseAmountRaw = parseTradeAmount(data.MAXSG)
+  const unlimitedMax = Number.isFinite(maxPurchaseAmountRaw) && maxPurchaseAmountRaw >= 1000000000
+  const purchaseStatus = data.SGZT || ''
+  const canBuy = data.BUY === true || data.ISBUY === '1'
+  const suspended = !canBuy || /暂停|停止|封闭/.test(purchaseStatus)
+  const limited = !suspended && Number.isFinite(maxPurchaseAmountRaw) && !unlimitedMax && /限|大额/.test(purchaseStatus)
+
+  return {
+    purchaseStatus,
+    redeemStatus: data.SHZT || '',
+    canBuy,
+    suspended,
+    limited,
+    minPurchaseAmount: parseTradeAmount(data.MINSG),
+    maxPurchaseAmount: limited ? maxPurchaseAmountRaw : null,
+    rawMaxPurchaseAmount: Number.isFinite(maxPurchaseAmountRaw) ? maxPurchaseAmountRaw : null,
+    minAutoInvestAmount: parseTradeAmount(data.MINDT),
+    autoInvestStatus: data.DTZT || '',
+    navDate: data.FSRQ || '',
+    currentDayMark: data.CURRENTDAYMARK || '',
+    source: payload ? 'tiantian-main' : '',
+  }
+}
+
 function inferCountryFromXueqiuSymbol(symbol = '', code = '') {
   const symbolValue = String(symbol || '').trim().toUpperCase()
   const codeValue = String(code || '').trim().toUpperCase()
@@ -1322,6 +1357,7 @@ async function main() {
     let xueqiuReturns = {}
     let rawPurchaseFee = null
     let purchaseFee = buildPurchaseFee(fund, rawPurchaseFee, null)
+    let purchaseLimit = parseTiantianPurchaseLimit(null)
     const fundCode = fundCodeFromCmf(fund)
     const onshoreFund = fundCode ? onshoreDisclosure.byCode[fundCode] : null
 
@@ -1336,12 +1372,14 @@ async function main() {
         historyError = chartResult.status === 'rejected' ? chartResult.reason.message : null
         historySource = history.length ? 'standard-chartered-morningstar' : 'none'
       } else if (fund['fund-type'] === 'cmf') {
-        const [infoResult, historyResult, growthResult] = await Promise.allSettled([
+        const [infoResult, historyResult, growthResult, tiantianResult] = await Promise.allSettled([
           fetchDanjuanFundInfo(fundCode),
           fetchDanjuanHistory(fundCode),
           fetchDanjuanGrowth(fundCode),
+          fetchTiantianFundMain(fundCode),
         ])
         const fundInfo = infoResult.status === 'fulfilled' ? infoResult.value : null
+        const tiantianMain = tiantianResult.status === 'fulfilled' ? tiantianResult.value : null
         const profileResult = await fetchDanjuanHoldingProfile(fund, fundCode, fundInfo, fundDirectory)
           .then((value) => ({ status: 'fulfilled', value }))
           .catch((reason) => ({ status: 'rejected', reason }))
@@ -1350,6 +1388,7 @@ async function main() {
         growthSeries = growthResult.status === 'fulfilled' ? growthResult.value : []
         xueqiuReturns = xueqiuPeriodReturns(fundInfo)
         rawPurchaseFee = parseDanjuanPurchaseFee(fundInfo)
+        purchaseLimit = parseTiantianPurchaseLimit(tiantianMain)
         historyError = historyResult.status === 'rejected' ? historyResult.reason.message : null
         historySource = history.length ? 'xueqiu-danjuan' : 'none'
       }
@@ -1372,6 +1411,7 @@ async function main() {
       growthSeries,
       xueqiuReturns,
       purchaseFee,
+      purchaseLimit,
     }
   })
 
@@ -1383,7 +1423,7 @@ async function main() {
   const fxPairs = await mapLimit(currencyCodes, 3, async (code) => [code, await fetchFxRates(code).catch(() => null)])
   const fxRates = Object.fromEntries(fxPairs)
 
-  const funds = withHistories.map(({ fund, history, historySource, historyError, holdingProfile, growthSeries, xueqiuReturns, purchaseFee }) => {
+  const funds = withHistories.map(({ fund, history, historySource, historyError, holdingProfile, growthSeries, xueqiuReturns, purchaseFee, purchaseLimit }) => {
     const currencyCode = CURRENCY_CODES[fund.currency] || fund.currency || ''
     const returnHistory = returnHistoryFromGrowth(growthSeries)
     const metricHistory = returnHistory.length >= 2 ? returnHistory : history
@@ -1426,6 +1466,7 @@ async function main() {
       historyError,
       holdingProfile,
       purchaseFee,
+      purchaseLimit,
       links: buildFundLinks(fund, fundCode),
       historyLocal: packHistory(history),
       historyCny: currencyCode === 'CNY' ? null : packHistory(cnyHistory),
@@ -1447,6 +1488,7 @@ async function main() {
     withFxAdjusted: funds.filter((fund) => fund.fxAdjusted).length,
     withCurrentFeeDiscount: funds.filter((fund) => fund.purchaseFee?.hasCurrentDiscount).length,
     withPurchaseFee: funds.filter((fund) => Number.isFinite(fund.purchaseFee?.effectiveRate)).length,
+    withPurchaseLimit: funds.filter((fund) => fund.purchaseLimit?.limited || fund.purchaseLimit?.suspended).length,
     byType: countBy(funds, (fund) => fund.typeLabel),
     byCurrency: countBy(funds, (fund) => fund.currency),
     byAssetClass: countBy(funds, (fund) => fund.assetClass),
