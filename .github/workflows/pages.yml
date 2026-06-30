@@ -11,9 +11,14 @@ on:
         required: true
         default: true
         type: boolean
+      commit_data:
+        description: 'Commit refreshed public/data/funds.json back to main'
+        required: true
+        default: true
+        type: boolean
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -40,6 +45,19 @@ jobs:
       - name: Refresh fund data
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.refresh_data }}
         run: npm run update-data
+
+      - name: Commit refreshed fund data
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.refresh_data && inputs.commit_data }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/data/funds.json
+          if git diff --cached --quiet; then
+            echo "No fund data changes to commit."
+          else
+            git commit -m "Update fund data [skip ci]"
+            git push
+          fi
 
       - name: Lint
         run: npm run lint
