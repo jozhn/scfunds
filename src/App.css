@@ -486,11 +486,21 @@ button.source-link {
   font: inherit;
 }
 
+.portfolio-visual {
+  width: 100%;
+  max-width: 1180px;
+  margin-top: 14px;
+}
+
+.portfolio-visual.compact {
+  max-width: 980px;
+}
+
 .portfolio-metrics {
   display: flex;
   flex-wrap: wrap;
   gap: 9px;
-  margin-top: 14px;
+  margin-top: 0;
 }
 
 .portfolio-chart-card {

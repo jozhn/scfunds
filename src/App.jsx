@@ -1134,6 +1134,8 @@ function PortfolioBuilder({ data, onOpenFund }) {
   const suggestedStart = useMemo(() => suggestedPortfolioStartDate(rows, fundsById), [fundsById, rows])
   const analysis = useMemo(() => buildPortfolioAnalysis(rows, fundsById, startDate), [fundsById, rows, startDate])
   const totalInputAmount = rows.reduce((sum, row) => sum + (Number(row.amount) || 0), 0)
+  const analysisDays = daysBetween(analysis.startDate, analysis.endDate)
+  const isCompactRange = Number.isFinite(analysisDays) && analysisDays < 270
 
   useEffect(() => {
     if (!funds.length || rows.length) return
@@ -1186,16 +1188,18 @@ function PortfolioBuilder({ data, onOpenFund }) {
         </div>
       </div>
 
-      <div className="portfolio-metrics">
-        <MetricPill icon={PieChart} label="配置金额" value={`${currencyAmount(totalInputAmount)}元`} />
-        <MetricPill icon={Check} label="申购费估算" value={`${currencyAmount(analysis.totalFee)}元`} />
-        <MetricPill icon={TrendingUp} label="累计收益" value={formatPercent(analysis.afterFeeReturn)} tone={classForValue(analysis.afterFeeReturn)} />
-        <MetricPill icon={BarChart3} label="年化" value={formatPercent(analysis.annualizedReturn)} tone={classForValue(analysis.annualizedReturn)} />
-        <MetricPill icon={ArrowDown} label="最大回撤" value={formatPercent(analysis.drawdown?.maxDrawdown)} tone={classForValue(analysis.drawdown?.maxDrawdown)} />
-        <MetricPill icon={Clock3} label="申购费回本" value={analysis.feeBreakEvenDate ? `${analysis.feeBreakEvenDate} / ${formatDays(analysis.feeBreakEvenDays)}` : '-'} />
-      </div>
+      <div className={isCompactRange ? 'portfolio-visual compact' : 'portfolio-visual'}>
+        <div className="portfolio-metrics">
+          <MetricPill icon={PieChart} label="配置金额" value={`${currencyAmount(totalInputAmount)}元`} />
+          <MetricPill icon={Check} label="申购费估算" value={`${currencyAmount(analysis.totalFee)}元`} />
+          <MetricPill icon={TrendingUp} label="累计收益" value={formatPercent(analysis.afterFeeReturn)} tone={classForValue(analysis.afterFeeReturn)} />
+          <MetricPill icon={BarChart3} label="年化" value={formatPercent(analysis.annualizedReturn)} tone={classForValue(analysis.annualizedReturn)} />
+          <MetricPill icon={ArrowDown} label="最大回撤" value={formatPercent(analysis.drawdown?.maxDrawdown)} tone={classForValue(analysis.drawdown?.maxDrawdown)} />
+          <MetricPill icon={Clock3} label="申购费回本" value={analysis.feeBreakEvenDate ? `${analysis.feeBreakEvenDate} / ${formatDays(analysis.feeBreakEvenDays)}` : '-'} />
+        </div>
 
-      <PortfolioReturnChart points={analysis.returnSeries} />
+        <PortfolioReturnChart points={analysis.returnSeries} />
+      </div>
 
       <div className="portfolio-body">
         <div className="portfolio-editor">
