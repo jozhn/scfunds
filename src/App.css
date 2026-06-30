@@ -486,6 +486,27 @@ button.source-link {
   font: inherit;
 }
 
+.portfolio-fee-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  max-width: 980px;
+  margin-top: 14px;
+  border: 1px solid rgba(22, 98, 86, 0.18);
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: #33443f;
+  background: rgba(22, 98, 86, 0.06);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.portfolio-fee-note svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--pine-2);
+}
+
 .portfolio-visual {
   width: 100%;
   max-width: 1180px;

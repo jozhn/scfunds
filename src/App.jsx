@@ -1188,6 +1188,13 @@ function PortfolioBuilder({ data, onOpenFund }) {
         </div>
       </div>
 
+      <div className="portfolio-fee-note">
+        <Info size={16} />
+        <span>
+          节省申购费思路：可先在费率更低的平台购买同款基金，在渣打仅买入最低限额，再确认转仓/转托管规则后把份额转入渣打持有。需核对基金份额类别、平台是否支持、转出转入费用和在途时间。
+        </span>
+      </div>
+
       <div className={isCompactRange ? 'portfolio-visual compact' : 'portfolio-visual'}>
         <div className="portfolio-metrics">
           <MetricPill icon={PieChart} label="配置金额" value={`${currencyAmount(totalInputAmount)}元`} />
