@@ -1059,6 +1059,14 @@ function purchaseLimitLabel(fund) {
   return limit.purchaseStatus || '开放申购'
 }
 
+function purchaseLimitStatusTone(fund) {
+  const limit = fund?.purchaseLimit
+  if (!limit?.source) return ''
+  if (limit.suspended) return 'blocked'
+  if (Number.isFinite(limit.maxPurchaseAmount)) return 'warn'
+  return ''
+}
+
 function purchaseLimitTone(fund, amount) {
   const limit = fund?.purchaseLimit
   const value = Number(amount)
@@ -1068,6 +1076,11 @@ function purchaseLimitTone(fund, amount) {
     return 'warn'
   }
   return ''
+}
+
+function PurchaseLimitBadge({ fund, amount }) {
+  const tone = amount === undefined ? purchaseLimitStatusTone(fund) : purchaseLimitTone(fund, amount)
+  return <span className={`purchase-limit-pill ${tone}`}>{purchaseLimitLabel(fund)}</span>
 }
 
 function purchaseLimitIssue(fund, amount) {
@@ -1307,7 +1320,7 @@ function PortfolioBuilder({ data, onOpenFund }) {
                   value={row.amount}
                   onChange={(event) => updateRow(row.id, { amount: event.target.value })}
                 />
-                <span className={`purchase-limit-pill ${limitTone}`}>{purchaseLimitLabel(fund)}</span>
+                <PurchaseLimitBadge fund={fund} amount={row.amount} />
                 <strong>{formatFeeRate(effectiveFeeRate(fund || {}))}</strong>
                 <button className="icon-button" type="button" onClick={() => removeRow(row.id)} title="删除">
                   <Trash2 size={15} />
@@ -1439,6 +1452,7 @@ function FundTable({ funds, viewMode, periodKey, sort, onSort, onOpenFund }) {
             <th>{sortableHeader('最大回撤', 'drawdown', 'right')}</th>
             <th>{sortableHeader('修复', 'recovery', 'right')}</th>
             <th>{sortableHeader('申购费', 'feeRate', 'right')}</th>
+            <th>申购限制</th>
             <th>{sortableHeader('回本', 'fee', 'right')}</th>
           </tr>
         </thead>
@@ -1480,6 +1494,7 @@ function FundTable({ funds, viewMode, periodKey, sort, onSort, onOpenFund }) {
                   {formatDays(recoveryDays)}
                 </td>
                 <td className="number"><PurchaseFeeBadge fund={fund} /></td>
+                <td><PurchaseLimitBadge fund={fund} /></td>
                 <td className="number">{hasHistory ? formatDays(metric?.feeBreakEvenDays) : '-'}</td>
               </tr>
             )
@@ -1604,6 +1619,18 @@ function FundDrawer({ fund, onClose }) {
               icon={Clock3}
               label="回撤修复"
               value={`${metric?.drawdown?.recovered === false ? '未修复 ' : ''}${formatDays(metric?.drawdown?.recoveryDays ?? metric?.drawdown?.unrecoveredDays)}`}
+            />
+            <MetricPill
+              icon={AlertTriangle}
+              label="申购状态"
+              value={purchaseLimit.purchaseStatus || '-'}
+              tone={purchaseLimit.suspended ? 'negative' : purchaseLimit.limited ? 'warning' : ''}
+            />
+            <MetricPill
+              icon={Info}
+              label="单日限购"
+              value={Number.isFinite(purchaseLimit.maxPurchaseAmount) ? `${currencyAmount(purchaseLimit.maxPurchaseAmount)}元` : '-'}
+              tone={purchaseLimit.limited ? 'warning' : ''}
             />
             <MetricPill icon={Check} label="申购费回本" value={formatDays(metric?.feeBreakEvenDays)} />
           </div>

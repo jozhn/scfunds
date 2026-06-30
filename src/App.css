@@ -967,6 +967,10 @@ tbody tr:last-child td {
   color: var(--gain-color) !important;
 }
 
+.warning {
+  color: var(--warn) !important;
+}
+
 .negative {
   color: var(--loss-color) !important;
 }
