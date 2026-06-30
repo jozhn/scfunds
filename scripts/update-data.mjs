@@ -1272,9 +1272,13 @@ function recommendationScore(fund) {
   )
 }
 
+function isTransferablePublicFund(fund) {
+  return fund?.fundType === 'cmf' && /^C\d+$/.test(fund.isin || '') && Boolean(fundCodeFromCmf(fund))
+}
+
 function buildRecommendations(funds) {
   return funds
-    .filter((fund) => fund.cnyMetrics?.pointCount >= 80)
+    .filter((fund) => isTransferablePublicFund(fund) && fund.cnyMetrics?.pointCount >= 80)
     .map((fund) => ({
       id: fund.id,
       score: recommendationScore(fund),

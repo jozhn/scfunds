@@ -49,15 +49,16 @@ const PERFORMANCE_CARD_PERIODS = [
 ]
 const DEFAULT_PORTFOLIO_TOTAL = 500000
 const DEFAULT_PORTFOLIO_ROWS = [
-  { token: 'QDUR134CNY', amount: 105000 },
   { token: '016664', amount: 80000 },
   { token: '270023', amount: 70000 },
-  { token: '968061', amount: 55000 },
   { token: '016452', amount: 40000 },
   { token: '007280', amount: 25000 },
   { token: '002610', amount: 50000 },
   { token: '001219', amount: 50000 },
   { token: '016633', amount: 25000 },
+  { token: '007490', amount: 75000 },
+  { token: '020628', amount: 55000 },
+  { token: '050022', amount: 30000 },
 ]
 
 function unpackHistory(history = []) {
@@ -840,9 +841,13 @@ function fundMatchesToken(fund, token) {
   return fund.id?.includes(token) || fund.isin?.includes(token) || fund.name?.includes(token)
 }
 
+function isTransferablePublicFund(fund) {
+  return fund?.fundType === 'cmf' && /^C\d+$/.test(fund.isin || '')
+}
+
 function createDefaultPortfolioRows(funds = []) {
   return DEFAULT_PORTFOLIO_ROWS.map((item, index) => {
-    const fund = funds.find((candidate) => fundMatchesToken(candidate, item.token))
+    const fund = funds.find((candidate) => isTransferablePublicFund(candidate) && fundMatchesToken(candidate, item.token))
     return {
       id: `default-${index}-${item.token}`,
       fundId: fund?.id || '',
@@ -1170,7 +1175,7 @@ function PortfolioBuilder({ data, onOpenFund }) {
         <div>
           <p className="eyebrow">自定义配置组合</p>
           <h2>组合回测</h2>
-          <p>金额按含申购费扣款处理，曲线使用人民币视角历史净值；默认组合为 50 万推荐配置。</p>
+          <p>金额按含申购费扣款处理，曲线使用人民币视角历史净值；默认组合仅选 50 万代销公募配置。</p>
         </div>
         <div className="portfolio-actions">
           <label className="date-control">
@@ -1212,7 +1217,7 @@ function PortfolioBuilder({ data, onOpenFund }) {
         <div className="portfolio-editor">
           <div className="card-title-row">
             <h3>配置明细</h3>
-            <span>默认 {currencyAmount(DEFAULT_PORTFOLIO_TOTAL)} 元，可直接改金额和基金</span>
+            <span>默认 {currencyAmount(DEFAULT_PORTFOLIO_TOTAL)} 元代销公募，可直接改金额和基金</span>
           </div>
           <div className="portfolio-row header">
             <span>基金</span>
