@@ -2,6 +2,10 @@
 
 渣打中国可购基金筛选、持仓穿透、区间收益和组合回测看板。
 
+线上访问：[https://john.js.org/scfunds/](https://john.js.org/scfunds/)
+
+![SC Funds 首页截图](docs/homepage.png)
+
 ## 本地运行
 
 ```bash
@@ -25,7 +29,7 @@ npm run build        # 构建静态站点
 仓库发布到：
 
 ```text
-https://jozhn.github.io/scfunds/
+https://john.js.org/scfunds/
 ```
 
 `.github/workflows/pages.yml` 使用 GitHub Pages 官方 Actions 部署静态站点：
