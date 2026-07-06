@@ -15,6 +15,7 @@ const DANJUAN_FUND_URL = 'https://danjuanfunds.com/funding'
 const DANJUAN_API_URL = 'https://danjuanfunds.com/djapi'
 const TIANTIAN_MAIN_URL = 'https://j5.fund.eastmoney.com/sc/tfs/qt/v2.0.1'
 const TIANTIAN_H5_FUND_URL = 'https://h5.1234567.com.cn/app/fund-details/'
+const TIANTIAN_OVERSEAS_URL = 'https://overseas.1234567.com.cn'
 const EASTMONEY_FUND_CODE_URL = 'https://fund.eastmoney.com/js/fundcode_search.js'
 const SC_FEE_DISCOUNT_FACTOR = 0.1
 
@@ -295,6 +296,7 @@ function extractHoldingProfile(detail = {}) {
 const danjuanFundInfoCache = new Map()
 const targetEtfHoldingCache = new Map()
 const tiantianMainCache = new Map()
+const tiantianOverseasFeeCache = new Map()
 
 function decodeHtml(value = '') {
   return String(value)
@@ -644,6 +646,87 @@ function parseDanjuanPurchaseFee(fundInfo) {
     officialRate,
     platformRate,
     platformDiscountFactor,
+    source: Number.isFinite(officialRate) ? 'xueqiu-official-fund-rate' : '',
+  }
+}
+
+function parseTiantianRate(value) {
+  const normalized = String(value ?? '')
+    .replace(/,/g, '')
+    .replace(/％/g, '%')
+    .trim()
+  if (!normalized || normalized === '--' || /暂无|免|免费/.test(normalized)) {
+    return /免|免费/.test(normalized) ? 0 : null
+  }
+
+  const match = normalized.match(/-?\d+(?:\.\d+)?/)
+  if (!match) return null
+
+  const number = Number(match[0])
+  return Number.isFinite(number) ? number / 100 : null
+}
+
+function purchaseFeeFromRates(officialRate, platformRate, source, extra = {}) {
+  if (!Number.isFinite(officialRate) && !Number.isFinite(platformRate)) return null
+
+  const platformDiscountFactor =
+    Number.isFinite(officialRate) && officialRate > 0 && Number.isFinite(platformRate)
+      ? platformRate / officialRate
+      : null
+
+  return {
+    officialRate,
+    platformRate,
+    platformDiscountFactor,
+    source,
+    ...extra,
+  }
+}
+
+function parseTiantianMainPurchaseFee(payload) {
+  const data = payload?.JJXQ?.Datas || {}
+  return purchaseFeeFromRates(
+    parseTiantianRate(data.SOURCERATE),
+    parseTiantianRate(data.RATE),
+    'tiantian-main-rate',
+    {
+      minPurchaseAmount: parseTradeAmount(data.MINSG),
+    },
+  )
+}
+
+function parseTiantianOverseasPurchaseFee(html) {
+  const start = html?.indexOf('申购费用') ?? -1
+  if (start < 0) return null
+
+  const redeemStart = html.indexOf('赎回费用', start)
+  const section = html.slice(start, redeemStart > start ? redeemStart : start + 5000)
+  const text = textFromHtml(section)
+  if (!/原费率|天天基金优惠费率|申购费用/.test(text)) return null
+
+  const rates = [...text.matchAll(/\d+(?:\.\d+)?\s*%/g)].map((match) => match[0])
+  return purchaseFeeFromRates(
+    parseTiantianRate(rates[0]),
+    parseTiantianRate(rates[1]),
+    'tiantian-overseas-rate',
+  )
+}
+
+function mergePurchaseFees(preferred, fallback) {
+  if (!preferred) return fallback || null
+  if (!fallback) return preferred
+
+  const officialRate = Number.isFinite(preferred.officialRate) ? preferred.officialRate : fallback.officialRate
+  const platformRate = Number.isFinite(preferred.platformRate) ? preferred.platformRate : fallback.platformRate
+  const platformDiscountFactor =
+    Number.isFinite(preferred.platformDiscountFactor) ? preferred.platformDiscountFactor : fallback.platformDiscountFactor
+
+  return {
+    officialRate,
+    platformRate,
+    platformDiscountFactor,
+    minPurchaseAmount: preferred.minPurchaseAmount ?? fallback.minPurchaseAmount ?? null,
+    source: Number.isFinite(preferred.officialRate) ? preferred.source : fallback.source,
   }
 }
 
@@ -892,6 +975,32 @@ async function fetchTiantianFundMain(fundCode) {
   })()
 
   tiantianMainCache.set(key, task)
+  return task
+}
+
+async function fetchTiantianOverseasPurchaseFee(fundCode) {
+  const key = String(fundCode || '').trim()
+  if (!key) return null
+  if (tiantianOverseasFeeCache.has(key)) return tiantianOverseasFeeCache.get(key)
+
+  const task = (async () => {
+    const url = `${TIANTIAN_OVERSEAS_URL}/f10/FundSaleInfo/${key}`
+    const html = await fetchText(
+      url,
+      {
+        headers: {
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          Referer: `${TIANTIAN_OVERSEAS_URL}/${key}`,
+          'User-Agent': 'Mozilla/5.0',
+        },
+      },
+      1,
+    ).catch(() => '')
+
+    return parseTiantianOverseasPurchaseFee(html)
+  })()
+
+  tiantianOverseasFeeCache.set(key, task)
   return task
 }
 
@@ -1197,7 +1306,7 @@ function buildPurchaseFee(fund, rawFee, onshoreFund) {
     discountTitle: currentDiscount?.title || '',
     discountUrl: currentDiscount?.url || '',
     discountMonth: currentDiscount?.month || '',
-    source: isCmf ? 'xueqiu-official-fund-rate' : 'qdmf-default-assumption',
+    source: isCmf ? rawFee?.source || '' : 'qdmf-default-assumption',
   }
 }
 
@@ -1387,7 +1496,12 @@ async function main() {
         holdingProfile = profileResult.status === 'fulfilled' ? profileResult.value : emptyHoldingProfile()
         growthSeries = growthResult.status === 'fulfilled' ? growthResult.value : []
         xueqiuReturns = xueqiuPeriodReturns(fundInfo)
-        rawPurchaseFee = parseDanjuanPurchaseFee(fundInfo)
+        const danjuanPurchaseFee = parseDanjuanPurchaseFee(fundInfo)
+        const tiantianMainPurchaseFee = parseTiantianMainPurchaseFee(tiantianMain)
+        const tiantianOverseasPurchaseFee = Number.isFinite(tiantianMainPurchaseFee?.officialRate)
+          ? null
+          : await fetchTiantianOverseasPurchaseFee(fundCode)
+        rawPurchaseFee = mergePurchaseFees(tiantianOverseasPurchaseFee || tiantianMainPurchaseFee, danjuanPurchaseFee)
         purchaseLimit = parseTiantianPurchaseLimit(tiantianMain)
         historyError = historyResult.status === 'rejected' ? historyResult.reason.message : null
         historySource = history.length ? 'xueqiu-danjuan' : 'none'
@@ -1511,6 +1625,7 @@ async function main() {
       danjuanFund: DANJUAN_FUND_URL,
       tiantianFund: TIANTIAN_H5_FUND_URL,
       tiantianMainApi: TIANTIAN_MAIN_URL,
+      tiantianOverseas: TIANTIAN_OVERSEAS_URL,
       eastmoneyFundDirectory: EASTMONEY_FUND_CODE_URL,
       fx: 'https://www.frankfurter.app/',
     },
