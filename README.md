@@ -3,6 +3,7 @@
 渣打中国可购基金筛选、持仓穿透、区间收益和组合回测看板。
 
 线上访问：[https://john.js.org/scfunds/](https://john.js.org/scfunds/)
+国内访问：[https://scfunds.jozhn.com/](https://scfunds.jozhn.com/)
 
 ![SC Funds 首页截图](docs/homepage.png)
 
