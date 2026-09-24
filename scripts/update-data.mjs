@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { classifyType, computeFundMetrics, FEE_RATE, PERIODS } from '../src/lib/finance.js'
 
@@ -18,6 +18,45 @@ const TIANTIAN_H5_FUND_URL = 'https://h5.1234567.com.cn/app/fund-details/'
 const TIANTIAN_OVERSEAS_URL = 'https://overseas.1234567.com.cn'
 const EASTMONEY_FUND_CODE_URL = 'https://fund.eastmoney.com/js/fundcode_search.js'
 const SC_FEE_DISCOUNT_FACTOR = 0.1
+
+// 表格页面只需要指标和持仓，逐日净值占整体体积 85% 以上。
+// 因此把逐日序列拆到单独文件里按需加载，避免首屏解析几十 MB 的 JSON。
+const SERIES_FIELDS = [
+  'historyLocal',
+  'historyCny',
+  'returnHistoryLocal',
+  'returnHistoryCny',
+  'growthSeries',
+]
+const RECENT_POINT_COUNT = 8
+
+function tailPoints(series) {
+  if (!Array.isArray(series) || !series.length) return null
+  return series.slice(-RECENT_POINT_COUNT)
+}
+
+export function splitFundData(funds) {
+  const seriesById = {}
+  const indexFunds = funds.map((fund) => {
+    const indexFund = { ...fund }
+    const series = {}
+
+    for (const field of SERIES_FIELDS) {
+      series[field] = fund[field] ?? null
+      delete indexFund[field]
+    }
+
+    seriesById[fund.id] = series
+    indexFund.hasSeries = SERIES_FIELDS.some((field) => Boolean(series[field]?.length))
+    indexFund.hasCnyHistory = Boolean(series.historyCny?.length)
+    indexFund.recentLocal = tailPoints(series.historyLocal)
+    indexFund.recentCny = tailPoints(series.historyCny)
+
+    return indexFund
+  })
+
+  return { indexFunds, seriesById }
+}
 
 const MANAGER_ALIASES = [
   '华泰柏瑞',
@@ -1647,15 +1686,32 @@ async function main() {
       count: category.funds?.length || 0,
     })),
     recommendations,
-    funds,
   }
 
-  const outPath = resolve(ROOT, 'public/data/funds.json')
-  await writeFile(outPath, `${JSON.stringify(output)}\n`, 'utf8')
-  console.log(`Wrote ${outPath}`)
+  const { indexFunds, seriesById } = splitFundData(funds)
+
+  const indexOutput = { ...output, funds: indexFunds }
+  const seriesOutput = {
+    generatedAt: output.generatedAt,
+    range: output.range,
+    funds: seriesById,
+  }
+
+  const indexPath = resolve(ROOT, 'public/data/funds.json')
+  const seriesPath = resolve(ROOT, 'public/data/funds-history.json')
+
+  await writeFile(indexPath, `${JSON.stringify(indexOutput)}\n`, 'utf8')
+  await writeFile(seriesPath, `${JSON.stringify(seriesOutput)}\n`, 'utf8')
+
+  console.log(`Wrote ${indexPath}`)
+  console.log(`Wrote ${seriesPath}`)
 }
 
-main().catch((error) => {
-  console.error(error)
-  process.exit(1)
-})
+const isDirectRun = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+
+if (isDirectRun) {
+  main().catch((error) => {
+    console.error(error)
+    process.exit(1)
+  })
+}

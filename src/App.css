@@ -99,6 +99,11 @@
   background: rgba(255, 255, 255, 0.1);
 }
 
+.summary-downloads {
+  display: flex;
+  gap: 8px;
+}
+
 .icon-link:hover,
 .icon-button:hover {
   border-color: var(--pine-2);
@@ -1668,6 +1673,43 @@ tbody tr:last-child td {
   border-radius: 8px;
   color: var(--muted);
   background: #ffffff;
+}
+
+.series-pending {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 120px;
+  justify-content: center;
+  margin-top: 16px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
+  color: var(--muted);
+  background: #ffffff;
+  font-size: 13px;
+}
+
+.portfolio-pending {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 28px 4px;
+  color: var(--muted);
+}
+
+.portfolio-pending h2 {
+  margin: 0 0 4px;
+  font-size: 16px;
+  color: var(--ink);
+}
+
+.portfolio-pending p {
+  margin: 0;
+  font-size: 13px;
+}
+
+.portfolio-pending .outline-button {
+  margin-left: auto;
 }
 
 .interval-table {

@@ -22,7 +22,7 @@ import {
   TrendingUp,
   X,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 
 import {
   PERIODS,
@@ -39,6 +39,25 @@ import './App.css'
 const PERIOD_LABELS = Object.fromEntries(PERIODS.map((period) => [period.key, period.label]))
 const DEFAULT_PERIOD = '1y'
 const DATA_URL = `${import.meta.env.BASE_URL}data/funds.json`
+const SERIES_URL = `${import.meta.env.BASE_URL}data/funds-history.json`
+const EMPTY_SERIES = []
+const EMPTY_FUNDS = []
+const EMPTY_TOKENS = []
+
+function toFilterNumber(value) {
+  if (value === '' || value === null || value === undefined) return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+// 省流模式或明显偏慢的网络下不主动预取 30MB 历史净值，改为真正需要时再加载。
+function canPrefetchSeries() {
+  const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection
+  if (!connection) return true
+  if (connection.saveData) return false
+  return !['slow-2g', '2g', '3g'].includes(connection.effectiveType)
+}
+
 const PERFORMANCE_CARD_PERIODS = [
   { key: '1m', label: '近1月' },
   { key: '3m', label: '近3月' },
@@ -61,8 +80,8 @@ const DEFAULT_PORTFOLIO_ROWS = [
   { token: '002610', amount: 15000 },
 ]
 
-function unpackHistory(history = []) {
-  return history.map(([date, value, dailyReturn]) => ({ date, value, dailyReturn }))
+function unpackHistory(series = []) {
+  return series.map(([date, value, dailyReturn]) => ({ date, value, dailyReturn }))
 }
 
 function unpackGrowthSeries(series = []) {
@@ -79,39 +98,74 @@ function metricFor(fund, viewMode, periodKey) {
   return metrics?.intervals?.[periodKey] || null
 }
 
-function historyFor(fund, viewMode) {
-  if (viewMode === 'cny' && fund.historyCny?.length) return unpackHistory(fund.historyCny)
-  return unpackHistory(fund.historyLocal)
+// 表格只带最近若干天净值（recent*），完整历史由 funds-history.json 按需加载。
+// 下面这些取值统一走“当前可用的序列”，两者都保持时间升序，热点路径不再排序或展开。
+function navSeriesFor(fund, viewMode) {
+  const full = viewMode === 'cny' && fund.historyCny?.length ? fund.historyCny : fund.historyLocal
+  if (full?.length) return full
+  if (viewMode === 'cny' && fund.recentCny?.length) return fund.recentCny
+  return fund.recentLocal || EMPTY_SERIES
+}
+
+function returnSeriesFor(fund, viewMode) {
+  const full = viewMode === 'cny' && fund.returnHistoryCny?.length ? fund.returnHistoryCny : fund.returnHistoryLocal
+  return full?.length ? full : navSeriesFor(fund, viewMode)
+}
+
+function portfolioSeriesFor(fund) {
+  if (fund.returnHistoryCny?.length) return fund.returnHistoryCny
+  if (fund.returnHistoryLocal?.length) return fund.returnHistoryLocal
+  if (fund.historyCny?.length) return fund.historyCny
+  return fund.historyLocal || EMPTY_SERIES
 }
 
 function returnHistoryFor(fund, viewMode) {
-  if (viewMode === 'cny' && fund.returnHistoryCny?.length) return unpackHistory(fund.returnHistoryCny)
-  if (fund.returnHistoryLocal?.length) return unpackHistory(fund.returnHistoryLocal)
-  return historyFor(fund, viewMode)
+  return unpackHistory(returnSeriesFor(fund, viewMode))
 }
+
+const portfolioHistoryCache = new WeakMap()
 
 function portfolioHistoryFor(fund) {
-  if (fund.returnHistoryCny?.length) return unpackHistory(fund.returnHistoryCny)
-  if (fund.returnHistoryLocal?.length) return unpackHistory(fund.returnHistoryLocal)
-  if (fund.historyCny?.length) return unpackHistory(fund.historyCny)
-  return unpackHistory(fund.historyLocal)
+  let points = portfolioHistoryCache.get(fund)
+  if (!points) {
+    points = unpackHistory(portfolioSeriesFor(fund))
+    portfolioHistoryCache.set(fund, points)
+  }
+  return points
 }
 
-function dailyRows(history = []) {
-  const points = [...history].sort((a, b) => a.date.localeCompare(b.date))
-  return points.map((point, index) => {
-    const previous = points[index - 1]
-    const dailyReturn = Number.isFinite(point.dailyReturn)
-      ? point.dailyReturn
-      : previous?.value
-        ? point.value / previous.value - 1
-        : null
-    return { ...point, dailyReturn }
-  })
+function packedDailyReturn(series) {
+  if (!series || series.length < 2) return null
+  const last = series[series.length - 1]
+  if (Number.isFinite(last[2])) return last[2]
+  const previous = series[series.length - 2]
+  return previous[1] > 0 ? last[1] / previous[1] - 1 : null
 }
 
-function latestDailyReturn(history = []) {
-  return dailyRows(history).at(-1)?.dailyReturn ?? null
+function dailyReturnFor(fund, viewMode) {
+  return packedDailyReturn(navSeriesFor(fund, viewMode))
+}
+
+function recentDailyRows(series, count = 5) {
+  if (!series || series.length < 2) return []
+
+  const rows = []
+  const start = Math.max(1, series.length - count)
+  for (let index = start; index < series.length; index += 1) {
+    const [date, value, dailyReturn] = series[index]
+    const previous = series[index - 1]
+    rows.push({
+      date,
+      value,
+      dailyReturn: Number.isFinite(dailyReturn)
+        ? dailyReturn
+        : previous[1] > 0
+          ? value / previous[1] - 1
+          : null,
+    })
+  }
+
+  return rows.reverse()
 }
 
 function periodReturn(history = [], periodKey) {
@@ -244,8 +298,21 @@ function hasLookThroughHoldings(fund) {
   )
 }
 
-function mainHoldings(fund, limit = 3) {
-  return displayHoldings(fund).slice(0, limit)
+// 持仓穿透、搜索文本这些派生数据只和基金本身有关，缓存起来避免每次筛选/渲染重算。
+const fundDisplayCache = new WeakMap()
+
+function fundDisplay(fund) {
+  let display = fundDisplayCache.get(fund)
+  if (!display) {
+    const holdings = displayHoldings(fund)
+    display = {
+      holdings,
+      chips: holdings.slice(0, 3),
+      searchText: `${fund.name} ${fund.isin} ${fund.house} ${fund.sector} ${fund.assetClass} ${holdingSearchText(fund)} ${fund.purchaseFee?.discountTitle || ''}`.toLowerCase(),
+    }
+    fundDisplayCache.set(fund, display)
+  }
+  return display
 }
 
 function effectiveFeeRate(fund) {
@@ -278,7 +345,7 @@ function getSortValue(fund, sortKey, viewMode, periodKey) {
     case 'return':
       return metric?.totalReturn
     case 'daily':
-      return latestDailyReturn(historyFor(fund, viewMode))
+      return dailyReturnFor(fund, viewMode)
     case 'annualized':
       return metric?.annualizedReturn
     case 'sharpe':
@@ -366,7 +433,7 @@ function MetricPill({ icon: Icon, label, value, tone }) {
 }
 
 function HoldingChips({ fund }) {
-  const holdings = mainHoldings(fund)
+  const holdings = fundDisplay(fund).chips
 
   if (!holdings.length) return <span className="empty-dash">-</span>
 
@@ -687,43 +754,79 @@ function PerformanceChart({
   fundName = '本产品',
 }) {
   const [hoverIndex, setHoverIndex] = useState(null)
-  const xueqiuSeries = resetGrowthSeries(unpackGrowthSeries(growthSeries), periodKey)
-  const metric = metrics?.intervals?.[periodKey] || null
-  const productSeries = normalizedReturnSeries(history, periodKey)
-  const startDate = productSeries[0]?.date
-  const endDate = productSeries.at(-1)?.date
-  const startMs = startDate ? dateMs(startDate) : null
-  const endMs = endDate ? dateMs(endDate) : null
-  const benchmarkSeries = xueqiuSeries
-    .filter((point) => Number.isFinite(point.benchmarkValue) && dateMs(point.date) >= startMs && dateMs(point.date) <= endMs)
-    .map((point) => ({ date: point.date, value: point.benchmarkValue }))
-  const performanceSeries = xueqiuSeries
-    .filter((point) => Number.isFinite(point.performanceValue) && dateMs(point.date) >= startMs && dateMs(point.date) <= endMs)
-    .map((point) => ({ date: point.date, value: point.performanceValue }))
 
-  if (productSeries.length < 2 || !Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs === endMs) {
-    return <div className="empty-chart">暂无走势</div>
-  }
+  // 曲线几何只在数据/区间变化时重算，鼠标移动只切换高亮点。
+  const chart = useMemo(() => {
+    const xueqiuSeries = resetGrowthSeries(unpackGrowthSeries(growthSeries), periodKey)
+    const metric = metrics?.intervals?.[periodKey] || null
+    const productSeries = normalizedReturnSeries(history, periodKey)
+    const startDate = productSeries[0]?.date
+    const endDate = productSeries.at(-1)?.date
+    const startMs = startDate ? dateMs(startDate) : null
+    const endMs = endDate ? dateMs(endDate) : null
+    const inRange = (point) => dateMs(point.date) >= startMs && dateMs(point.date) <= endMs
+    const benchmarkSeries = xueqiuSeries
+      .filter((point) => Number.isFinite(point.benchmarkValue) && inRange(point))
+      .map((point) => ({ date: point.date, value: point.benchmarkValue }))
+    const performanceSeries = xueqiuSeries
+      .filter((point) => Number.isFinite(point.performanceValue) && inRange(point))
+      .map((point) => ({ date: point.date, value: point.performanceValue }))
 
-  const width = 720
-  const height = 260
-  const values = [...productSeries, ...benchmarkSeries, ...performanceSeries].map((point) => point.value)
-  const rawMin = Math.min(0, ...values)
-  const rawMax = Math.max(0, ...values)
-  const padding = Math.max((rawMax - rawMin) * 0.12, 0.02)
-  const min = rawMin - padding
-  const max = rawMax + padding
-  const zeroY = height - ((0 - min) / (max - min || 1)) * (height - 28) - 14
-  const productPath = chartPath(productSeries, width, height, min, max, startMs, endMs)
-  const benchmarkPath = benchmarkSeries.length ? chartPath(benchmarkSeries, width, height, min, max, startMs, endMs) : ''
-  const performancePath = performanceSeries.length ? chartPath(performanceSeries, width, height, min, max, startMs, endMs) : ''
-  const productReturn = Number.isFinite(metric?.totalReturn) ? metric.totalReturn : productSeries.at(-1)?.value
-  const benchmarkReturn = benchmarkSeries.at(-1)?.value
-  const performanceReturn = performanceSeries.at(-1)?.value
-  const yTicks = [max, (max + min) / 2, 0, min]
-  const productCoordinates = chartCoordinates(productSeries, width, height, min, max, startMs, endMs)
+    if (productSeries.length < 2 || !Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs === endMs) {
+      return null
+    }
+
+    const width = 720
+    const height = 260
+    const values = [...productSeries, ...benchmarkSeries, ...performanceSeries].map((point) => point.value)
+    const rawMin = Math.min(0, ...values)
+    const rawMax = Math.max(0, ...values)
+    const padding = Math.max((rawMax - rawMin) * 0.12, 0.02)
+    const min = rawMin - padding
+    const max = rawMax + padding
+    const zeroY = height - ((0 - min) / (max - min || 1)) * (height - 28) - 14
+
+    return {
+      width,
+      height,
+      zeroY,
+      productSeries,
+      benchmarkSeries,
+      performanceSeries,
+      productPath: chartPath(productSeries, width, height, min, max, startMs, endMs),
+      benchmarkPath: benchmarkSeries.length ? chartPath(benchmarkSeries, width, height, min, max, startMs, endMs) : '',
+      performancePath: performanceSeries.length
+        ? chartPath(performanceSeries, width, height, min, max, startMs, endMs)
+        : '',
+      productCoordinates: chartCoordinates(productSeries, width, height, min, max, startMs, endMs),
+      dateTicks: chartDateTicks(productSeries, width, startMs, endMs),
+      yTicks: [max, (max + min) / 2, 0, min],
+      productReturn: Number.isFinite(metric?.totalReturn) ? metric.totalReturn : productSeries.at(-1)?.value,
+      benchmarkReturn: benchmarkSeries.at(-1)?.value,
+      performanceReturn: performanceSeries.at(-1)?.value,
+    }
+  }, [growthSeries, history, metrics, periodKey])
+
+  if (!chart) return <div className="empty-chart">暂无走势</div>
+
+  const {
+    width,
+    height,
+    zeroY,
+    productSeries,
+    benchmarkSeries,
+    performanceSeries,
+    productPath,
+    benchmarkPath,
+    performancePath,
+    productCoordinates,
+    dateTicks,
+    yTicks,
+    productReturn,
+    benchmarkReturn,
+    performanceReturn,
+  } = chart
   const hoverPoint = Number.isInteger(hoverIndex) ? productCoordinates[hoverIndex] : null
-  const dateTicks = chartDateTicks(productSeries, width, startMs, endMs)
   const handlePointerMove = (event) => {
     const x = Math.min(Math.max(svgPointerX(event, width), 0), width)
     const closestIndex = closestCoordinateIndex(productCoordinates, x)
@@ -807,8 +910,8 @@ function PerformanceChart({
   )
 }
 
-function FundPerformanceTable({ history }) {
-  const rows = dailyRows(history).slice(-5).reverse()
+function FundPerformanceTable({ series }) {
+  const rows = useMemo(() => recentDailyRows(series), [series])
 
   return (
     <div className="fund-performance-table">
@@ -871,7 +974,7 @@ function pointAtOrAfter(points, date) {
 
 function portfolioFundOptions(funds = []) {
   return [...funds]
-    .filter((fund) => fund.localMetrics?.pointCount > 1 || fund.historyCny?.length > 1)
+    .filter((fund) => fund.localMetrics?.pointCount > 1 || fund.cnyMetrics?.pointCount > 1)
     .sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'))
 }
 
@@ -992,21 +1095,28 @@ function buildPortfolioAnalysis(rows, fundsById, startDate) {
     }
   }
 
-  const valueSeries = [...dateSet]
-    .sort()
-    .map((date) => {
-      const totalValue = positions.reduce((sum, position) => {
-        const point = pointAtOrBefore(position.points, date)
-        return point ? sum + position.units * point.value : sum
-      }, 0)
+  // 日期与持仓净值都已升序，用游标推进代替逐日期线性回溯，避免大区间回测卡顿。
+  const cursors = positions.map(() => 0)
+  const valueSeries = []
 
-      return {
-        date,
-        totalValue,
-        value: totalAmount > 0 ? totalValue / totalAmount - 1 : null,
-      }
+  for (const date of [...dateSet].sort()) {
+    let totalValue = 0
+
+    positions.forEach((position, index) => {
+      const points = position.points
+      let cursor = cursors[index]
+      while (cursor + 1 < points.length && points[cursor + 1].date <= date) cursor += 1
+      cursors[index] = cursor
+
+      const point = points[cursor]
+      if (point && point.date <= date) totalValue += position.units * point.value
     })
-    .filter((point) => Number.isFinite(point.totalValue) && point.totalValue > 0 && Number.isFinite(point.value))
+
+    const value = totalAmount > 0 ? totalValue / totalAmount - 1 : null
+    if (Number.isFinite(totalValue) && totalValue > 0 && Number.isFinite(value)) {
+      valueSeries.push({ date, totalValue, value })
+    }
+  }
 
   const endPoint = valueSeries.at(-1)
   const initialPoint = valueSeries[0]
@@ -1129,24 +1239,36 @@ function PortfolioChartTooltip({ point, width }) {
 function PortfolioReturnChart({ points }) {
   const [hoverIndex, setHoverIndex] = useState(null)
 
-  if (points.length < 2) return <div className="empty-chart">选择买入日期后显示组合走势</div>
+  const chart = useMemo(() => {
+    if (points.length < 2) return null
 
-  const width = 720
-  const height = 230
-  const startMs = dateMs(points[0].date)
-  const endMs = dateMs(points.at(-1).date)
-  const values = points.map((point) => point.value)
-  const rawMin = Math.min(0, ...values)
-  const rawMax = Math.max(0, ...values)
-  const padding = Math.max((rawMax - rawMin) * 0.12, 0.01)
-  const min = rawMin - padding
-  const max = rawMax + padding
-  const zeroY = height - ((0 - min) / (max - min || 1)) * (height - 28) - 14
-  const path = chartPath(points, width, height, min, max, startMs, endMs)
-  const coordinates = chartCoordinates(points, width, height, min, max, startMs, endMs)
+    const width = 720
+    const height = 230
+    const startMs = dateMs(points[0].date)
+    const endMs = dateMs(points.at(-1).date)
+    const values = points.map((point) => point.value)
+    const rawMin = Math.min(0, ...values)
+    const rawMax = Math.max(0, ...values)
+    const padding = Math.max((rawMax - rawMin) * 0.12, 0.01)
+    const min = rawMin - padding
+    const max = rawMax + padding
+    const zeroY = height - ((0 - min) / (max - min || 1)) * (height - 28) - 14
+
+    return {
+      width,
+      height,
+      zeroY,
+      path: chartPath(points, width, height, min, max, startMs, endMs),
+      coordinates: chartCoordinates(points, width, height, min, max, startMs, endMs),
+      dateTicks: chartDateTicks(points, width, startMs, endMs),
+      yTicks: [max, (max + min) / 2, 0, min],
+    }
+  }, [points])
+
+  if (!chart) return <div className="empty-chart">选择买入日期后显示组合走势</div>
+
+  const { width, height, zeroY, path, coordinates, dateTicks, yTicks } = chart
   const hoverPoint = Number.isInteger(hoverIndex) ? coordinates[hoverIndex] : null
-  const dateTicks = chartDateTicks(points, width, startMs, endMs)
-  const yTicks = [max, (max + min) / 2, 0, min]
   const handlePointerMove = (event) => {
     const x = Math.min(Math.max(svgPointerX(event, width), 0), width)
     const closestIndex = closestCoordinateIndex(coordinates, x)
@@ -1195,9 +1317,17 @@ function PortfolioReturnChart({ points }) {
   )
 }
 
-function PortfolioBuilder({ data, onOpenFund }) {
-  const funds = data.funds
+function PortfolioBuilder({ funds: indexFunds, series, onOpenFund }) {
+  const funds = useMemo(
+    () => indexFunds.map((fund) => (series?.[fund.id] ? { ...fund, ...series[fund.id] } : fund)),
+    [indexFunds, series],
+  )
   const fundOptions = useMemo(() => portfolioFundOptions(funds), [funds])
+  // 400 多只基金 × 每行一个下拉，复用元素对象让 React 在行重渲染时跳过选项子树。
+  const fundOptionElements = useMemo(
+    () => fundOptions.map((option) => <option key={option.id} value={option.id}>{option.name}</option>),
+    [fundOptions],
+  )
   const fundsById = useMemo(() => new Map(funds.map((fund) => [fund.id, fund])), [funds])
   const [rows, setRows] = useState([])
   const [startDate, setStartDate] = useState('')
@@ -1307,11 +1437,7 @@ function PortfolioBuilder({ data, onOpenFund }) {
             return (
               <div className={`portfolio-row ${limitTone ? `limit-${limitTone}` : ''}`} key={row.id}>
                 <select value={row.fundId} onChange={(event) => updateRow(row.id, { fundId: event.target.value })}>
-                  {fundOptions.map((option) => (
-                    <option key={option.id} value={option.id}>
-                      {option.name}
-                    </option>
-                  ))}
+                  {fundOptionElements}
                 </select>
                 <input
                   type="number"
@@ -1356,7 +1482,7 @@ function PortfolioBuilder({ data, onOpenFund }) {
           </dl>
           <div className="portfolio-position-list">
             {analysis.positions.map((position) => (
-              <button key={position.fund.id} type="button" onClick={() => onOpenFund(position.fund)}>
+              <button key={position.fund.id} type="button" onClick={() => onOpenFund(position.fund.id)}>
                 <span>{position.fund.name}</span>
                 <strong>{formatPercent(position.amount / (analysis.totalAmount || 1), 1)}</strong>
               </button>
@@ -1376,9 +1502,14 @@ function SummaryPanel({ data }) {
           <p className="eyebrow">渣打中国代客理财与基金</p>
           <h1>基金筛选看板</h1>
         </div>
-        <a className="icon-link" href={DATA_URL} download title="下载数据 JSON">
-          <Download size={18} />
-        </a>
+        <div className="summary-downloads">
+          <a className="icon-link" href={DATA_URL} download title="下载基金列表 JSON（指标、持仓、费率）">
+            <Download size={18} />
+          </a>
+          <a className="icon-link" href={SERIES_URL} download title="下载历史净值 JSON（逐日曲线，约 32MB）">
+            <LineChart size={18} />
+          </a>
+        </div>
       </div>
 
       <div className="summary-grid">
@@ -1428,7 +1559,52 @@ function SummaryPanel({ data }) {
   )
 }
 
-function FundTable({ funds, viewMode, periodKey, sort, onSort, onOpenFund }) {
+const FundRow = memo(function FundRow({ fund, viewMode, periodKey, onOpenFund }) {
+  const metric = metricFor(fund, viewMode, periodKey)
+  const recoveryDays = metric?.drawdown?.recoveryDays ?? metric?.drawdown?.unrecoveredDays
+  const hasHistory = fund.localMetrics.pointCount > 1
+  const dailyReturn = dailyReturnFor(fund, viewMode)
+  const foreign = isForeignCurrency(fund)
+
+  return (
+    <tr onClick={() => onOpenFund(fund.id)}>
+      <td>
+        <div className="fund-cell">
+          <strong>{fund.name}</strong>
+          <span>{fund.house || '-'} / {fund.sector || '-'} / {fund.isin}</span>
+        </div>
+      </td>
+      <td>
+        <HoldingChips fund={fund} />
+      </td>
+      <td>
+        <span className="tag">{fund.typeLabel}</span>
+      </td>
+      <td>
+        <span className={foreign ? 'currency warn' : 'currency'}>
+          {fund.currency}
+          {foreign && <AlertTriangle size={12} />}
+        </span>
+      </td>
+      <td className={`number ${classForValue(dailyReturn)}`}>{formatPercent(dailyReturn)}</td>
+      <td className={`number ${classForValue(metric?.totalReturn)}`}>{formatPercent(metric?.totalReturn)}</td>
+      <td className={`number ${classForValue(metric?.annualizedReturn)}`}>
+        {formatPercent(metric?.annualizedReturn)}
+      </td>
+      <td className="number">{formatNumber(metric?.sharpe)}</td>
+      <td className={`number ${classForValue(metric?.maxDrawdown)}`}>{formatPercent(metric?.maxDrawdown)}</td>
+      <td className="number">
+        {metric?.drawdown?.recovered === false && Number.isFinite(recoveryDays) ? '未修复 ' : ''}
+        {formatDays(recoveryDays)}
+      </td>
+      <td className="number"><PurchaseFeeBadge fund={fund} /></td>
+      <td><PurchaseLimitBadge fund={fund} /></td>
+      <td className="number">{hasHistory ? formatDays(metric?.feeBreakEvenDays) : '-'}</td>
+    </tr>
+  )
+})
+
+const FundTable = memo(function FundTable({ funds, viewMode, periodKey, sort, onSort, onOpenFund }) {
   const sortableHeader = (label, key, align = '') => (
     <button className={`sort-header ${align}`} type="button" onClick={() => onSort(key)}>
       {label}
@@ -1457,53 +1633,20 @@ function FundTable({ funds, viewMode, periodKey, sort, onSort, onOpenFund }) {
           </tr>
         </thead>
         <tbody>
-          {funds.map((fund) => {
-            const metric = metricFor(fund, viewMode, periodKey)
-            const recoveryDays = metric?.drawdown?.recoveryDays ?? metric?.drawdown?.unrecoveredDays
-            const hasHistory = fund.localMetrics.pointCount > 1
-            const dailyReturn = latestDailyReturn(historyFor(fund, viewMode))
-            return (
-              <tr key={fund.id} onClick={() => onOpenFund(fund)}>
-                <td>
-                  <div className="fund-cell">
-                    <strong>{fund.name}</strong>
-                    <span>{fund.house || '-'} / {fund.sector || '-'} / {fund.isin}</span>
-                  </div>
-                </td>
-                <td>
-                  <HoldingChips fund={fund} />
-                </td>
-                <td>
-                  <span className="tag">{fund.typeLabel}</span>
-                </td>
-                <td>
-                  <span className={isForeignCurrency(fund) ? 'currency warn' : 'currency'}>
-                    {fund.currency}
-                    {isForeignCurrency(fund) && <AlertTriangle size={12} />}
-                  </span>
-                </td>
-                <td className={`number ${classForValue(dailyReturn)}`}>{formatPercent(dailyReturn)}</td>
-                <td className={`number ${classForValue(metric?.totalReturn)}`}>{formatPercent(metric?.totalReturn)}</td>
-                <td className={`number ${classForValue(metric?.annualizedReturn)}`}>
-                  {formatPercent(metric?.annualizedReturn)}
-                </td>
-                <td className="number">{formatNumber(metric?.sharpe)}</td>
-                <td className={`number ${classForValue(metric?.maxDrawdown)}`}>{formatPercent(metric?.maxDrawdown)}</td>
-                <td className="number">
-                  {metric?.drawdown?.recovered === false && Number.isFinite(recoveryDays) ? '未修复 ' : ''}
-                  {formatDays(recoveryDays)}
-                </td>
-                <td className="number"><PurchaseFeeBadge fund={fund} /></td>
-                <td><PurchaseLimitBadge fund={fund} /></td>
-                <td className="number">{hasHistory ? formatDays(metric?.feeBreakEvenDays) : '-'}</td>
-              </tr>
-            )
-          })}
+          {funds.map((fund) => (
+            <FundRow
+              key={fund.id}
+              fund={fund}
+              viewMode={viewMode}
+              periodKey={periodKey}
+              onOpenFund={onOpenFund}
+            />
+          ))}
         </tbody>
       </table>
     </div>
   )
-}
+})
 
 function PeriodMetrics({ fund, viewMode }) {
   const metrics = viewMode === 'cny' ? fund.cnyMetrics : fund.localMetrics
@@ -1546,12 +1689,15 @@ function PeriodMetrics({ fund, viewMode }) {
   )
 }
 
-function FundDrawer({ fund, onClose }) {
+function FundDrawer({ fund: indexFund, series, seriesReady, seriesError, onLoadSeries, onClose }) {
+  const fund = useMemo(() => (series ? { ...indexFund, ...series } : indexFund), [indexFund, series])
   const [periodKey, setPeriodKey] = useState(DEFAULT_PERIOD)
-  const [viewMode, setViewMode] = useState(isForeignCurrency(fund) && fund.historyCny?.length ? 'cny' : 'local')
+  const [viewMode, setViewMode] = useState(() =>
+    isForeignCurrency(indexFund) && indexFund.hasCnyHistory ? 'cny' : 'local',
+  )
   const metric = metricFor(fund, viewMode, periodKey)
-  const navHistory = historyFor(fund, viewMode)
-  const returnHistory = returnHistoryFor(fund, viewMode)
+  const navSeries = navSeriesFor(fund, viewMode)
+  const returnHistory = useMemo(() => returnHistoryFor(fund, viewMode), [fund, viewMode])
   const localMetric = metricFor(fund, 'local', periodKey)
   const cnyMetric = metricFor(fund, 'cny', periodKey)
   const fxImpact =
@@ -1560,12 +1706,12 @@ function FundDrawer({ fund, onClose }) {
       : null
   const purchaseFee = fund.purchaseFee || {}
   const purchaseLimit = fund.purchaseLimit || {}
-  const dailyReturn = latestDailyReturn(navHistory)
+  const dailyReturn = packedDailyReturn(navSeries)
+  const seriesPending = !seriesReady && Boolean(indexFund.hasSeries)
 
   useEffect(() => {
-    setViewMode(isForeignCurrency(fund) && fund.historyCny?.length ? 'cny' : 'local')
-    setPeriodKey(DEFAULT_PERIOD)
-  }, [fund])
+    onLoadSeries()
+  }, [onLoadSeries])
 
   return (
     <div className="drawer-backdrop" onClick={onClose}>
@@ -1590,7 +1736,7 @@ function FundDrawer({ fund, onClose }) {
             <button
               className={viewMode === 'cny' ? 'active' : ''}
               type="button"
-              disabled={!fund.historyCny?.length && isForeignCurrency(fund)}
+              disabled={!fund.hasCnyHistory && isForeignCurrency(fund)}
               onClick={() => setViewMode('cny')}
             >
               人民币
@@ -1647,16 +1793,28 @@ function FundDrawer({ fund, onClose }) {
             </div>
           )}
 
-          <PerformanceChart
-            history={returnHistory}
-            periodKey={periodKey}
-            growthSeries={!isForeignCurrency(fund) ? fund.growthSeries : []}
-            xueqiuReturns={!isForeignCurrency(fund) ? fund.xueqiuReturns : null}
-            metrics={viewMode === 'cny' ? fund.cnyMetrics : fund.localMetrics}
-            fundName="本产品"
-            onPeriodChange={setPeriodKey}
-          />
-          <FundPerformanceTable history={navHistory} />
+          {seriesPending ? (
+            <div className="series-pending">
+              <RefreshCw className={seriesError ? '' : 'spin'} size={16} />
+              <span>{seriesError ? '历史净值暂不可用' : '正在载入历史净值…'}</span>
+              {seriesError ? (
+                <button className="outline-button" type="button" onClick={onLoadSeries}>
+                  重试
+                </button>
+              ) : null}
+            </div>
+          ) : (
+            <PerformanceChart
+              history={returnHistory}
+              periodKey={periodKey}
+              growthSeries={!isForeignCurrency(fund) ? fund.growthSeries || EMPTY_SERIES : EMPTY_SERIES}
+              xueqiuReturns={!isForeignCurrency(fund) ? fund.xueqiuReturns : null}
+              metrics={viewMode === 'cny' ? fund.cnyMetrics : fund.localMetrics}
+              fundName="本产品"
+              onPeriodChange={setPeriodKey}
+            />
+          )}
+          <FundPerformanceTable series={navSeries} />
         </section>
 
         <section className="drawer-section">
@@ -1672,7 +1830,7 @@ function FundDrawer({ fund, onClose }) {
             <AllocationBars title="持仓行业" items={fund.holdingProfile?.sector} />
             <AllocationBars title="资产配置" items={fund.holdingProfile?.asset} />
             <TopHoldings
-              holdings={displayHoldings(fund)}
+              holdings={fundDisplay(fund).holdings}
               lastUpdated={fund.holdingProfile?.lastUpdated}
               lookThrough={hasLookThroughHoldings(fund)}
             />
@@ -1732,7 +1890,9 @@ function FundDrawer({ fund, onClose }) {
 function App() {
   const [data, setData] = useState(null)
   const [loadError, setLoadError] = useState('')
-  const [selectedFund, setSelectedFund] = useState(null)
+  const [series, setSeries] = useState(null)
+  const [seriesError, setSeriesError] = useState('')
+  const [selectedFundId, setSelectedFundId] = useState(null)
   const [activeTab, setActiveTab] = useState('funds')
   const [query, setQuery] = useState('')
   const [periodKey, setPeriodKey] = useState(DEFAULT_PERIOD)
@@ -1753,6 +1913,7 @@ function App() {
     hideForeign: false,
   })
   const [sort, setSort] = useState({ key: 'annualized', direction: 'desc' })
+  const seriesRequestRef = useRef(null)
 
   useEffect(() => {
     fetch(DATA_URL)
@@ -1763,6 +1924,52 @@ function App() {
       .then(setData)
       .catch((error) => setLoadError(error.message))
   }, [])
+
+  // 逐日净值单独成文件，首屏只解析轻量索引；打开详情或组合回测时再拉取完整序列。
+  const loadSeries = useCallback(() => {
+    if (!seriesRequestRef.current) {
+      seriesRequestRef.current = fetch(SERIES_URL)
+        .then((response) => {
+          if (!response.ok) throw new Error('无法读取 public/data/funds-history.json，请先运行 npm run update-data')
+          return response.json()
+        })
+        .then((payload) => {
+          setSeries(payload.funds || {})
+          setSeriesError('')
+          return payload.funds || {}
+        })
+        .catch((error) => {
+          setSeriesError('历史净值数据加载失败，请检查网络后重试')
+          console.error(error)
+          seriesRequestRef.current = null
+          return null
+        })
+    }
+
+    return seriesRequestRef.current
+  }, [])
+
+  useEffect(() => {
+    if (!data) return undefined
+    if (!canPrefetchSeries()) return undefined
+
+    if (typeof window.requestIdleCallback === 'function') {
+      const handle = window.requestIdleCallback(() => loadSeries(), { timeout: 3000 })
+      return () => window.cancelIdleCallback(handle)
+    }
+
+    const timer = window.setTimeout(() => loadSeries(), 800)
+    return () => window.clearTimeout(timer)
+  }, [data, loadSeries])
+
+  const funds = data ? data.funds : EMPTY_FUNDS
+
+  const selectedFund = useMemo(
+    () => (selectedFundId ? funds.find((fund) => fund.id === selectedFundId) || null : null),
+    [funds, selectedFundId],
+  )
+
+  const seriesReady = Boolean(series)
 
   useEffect(() => {
     if (!selectedFund) return undefined
@@ -1780,71 +1987,93 @@ function App() {
   }, [selectedFund])
 
   const filterOptions = useMemo(() => {
-    const funds = data?.funds || []
+    const allFunds = data?.funds || EMPTY_FUNDS
     return {
-      type: uniqueOptions(funds, 'typeLabel'),
-      currency: uniqueOptions(funds, 'currency'),
-      assetClass: uniqueOptions(funds, 'assetClass'),
-      sector: uniqueOptions(funds, 'sector'),
+      type: uniqueOptions(allFunds, 'typeLabel'),
+      currency: uniqueOptions(allFunds, 'currency'),
+      assetClass: uniqueOptions(allFunds, 'assetClass'),
+      sector: uniqueOptions(allFunds, 'sector'),
     }
   }, [data])
 
+  // 搜索框保持即时响应，列表用延后的关键字过滤，避免每次按键都重排整张表。
+  const deferredQuery = useDeferredValue(query)
+
   const filteredFunds = useMemo(() => {
-    if (!data) return []
-    const normalizedQuery = query.trim().toLowerCase()
+    if (!data) return EMPTY_FUNDS
+    const normalizedQuery = deferredQuery.trim().toLowerCase()
     const direction = sort.direction === 'desc' ? -1 : 1
+    const tokens = normalizedQuery ? normalizedQuery.split(/\s+/).filter(Boolean) : EMPTY_TOKENS
+    const minAnnualized = toFilterNumber(filters.minAnnualized)
+    const maxDrawdown = toFilterNumber(filters.maxDrawdown)
+    const maxRecoveryDays = toFilterNumber(filters.maxRecoveryDays)
+    const minSharpe = toFilterNumber(filters.minSharpe)
+    const rows = []
 
-    return data.funds
-      .filter((fund) => {
-        const metric = metricFor(fund, viewMode, periodKey)
-        const recoveryDays = metric?.drawdown?.recoveryDays ?? metric?.drawdown?.unrecoveredDays
-        const drawdownAbs = Number.isFinite(metric?.maxDrawdown) ? Math.abs(metric.maxDrawdown) * 100 : null
-        const annualized = Number.isFinite(metric?.annualizedReturn) ? metric.annualizedReturn * 100 : null
-        const holdingText = holdingSearchText(fund)
+    for (const fund of funds) {
+      const metric = metricFor(fund, viewMode, periodKey)
+      const recoveryDays = metric?.drawdown?.recoveryDays ?? metric?.drawdown?.unrecoveredDays
+      const drawdownAbs = Number.isFinite(metric?.maxDrawdown) ? Math.abs(metric.maxDrawdown) * 100 : null
+      const annualized = Number.isFinite(metric?.annualizedReturn) ? metric.annualizedReturn * 100 : null
 
-        if (filters.requireHistory && fund.localMetrics.pointCount < 2) return false
-        if (
-          filters.requireHoldings &&
-          !fund.holdingProfile?.topHoldings?.length &&
-          !fund.holdingProfile?.fundHoldings?.length
-        ) return false
-        if (filters.requireFeeDiscount && !fund.purchaseFee?.hasCurrentDiscount) return false
-        if (filters.hideForeign && isForeignCurrency(fund)) return false
-        if (filters.type !== 'all' && fund.typeLabel !== filters.type) return false
-        if (filters.currency !== 'all' && fund.currency !== filters.currency) return false
-        if (filters.assetClass !== 'all' && fund.assetClass !== filters.assetClass) return false
-        if (filters.sector !== 'all' && fund.sector !== filters.sector) return false
-        if (filters.minAnnualized && (!Number.isFinite(annualized) || annualized < Number(filters.minAnnualized))) return false
-        if (filters.maxDrawdown && (!Number.isFinite(drawdownAbs) || drawdownAbs > Number(filters.maxDrawdown))) return false
-        if (filters.maxRecoveryDays && (!Number.isFinite(recoveryDays) || recoveryDays > Number(filters.maxRecoveryDays))) return false
-        if (filters.minSharpe && (!Number.isFinite(metric?.sharpe) || metric.sharpe < Number(filters.minSharpe))) return false
+      if (filters.requireHistory && fund.localMetrics.pointCount < 2) continue
+      if (
+        filters.requireHoldings &&
+        !fund.holdingProfile?.topHoldings?.length &&
+        !fund.holdingProfile?.fundHoldings?.length
+      ) continue
+      if (filters.requireFeeDiscount && !fund.purchaseFee?.hasCurrentDiscount) continue
+      if (filters.hideForeign && isForeignCurrency(fund)) continue
+      if (filters.type !== 'all' && fund.typeLabel !== filters.type) continue
+      if (filters.currency !== 'all' && fund.currency !== filters.currency) continue
+      if (filters.assetClass !== 'all' && fund.assetClass !== filters.assetClass) continue
+      if (filters.sector !== 'all' && fund.sector !== filters.sector) continue
+      if (minAnnualized !== null && (!Number.isFinite(annualized) || annualized < minAnnualized)) continue
+      if (maxDrawdown !== null && (!Number.isFinite(drawdownAbs) || drawdownAbs > maxDrawdown)) continue
+      if (maxRecoveryDays !== null && (!Number.isFinite(recoveryDays) || recoveryDays > maxRecoveryDays)) continue
+      if (minSharpe !== null && (!Number.isFinite(metric?.sharpe) || metric.sharpe < minSharpe)) continue
 
-        if (normalizedQuery) {
-          const haystack =
-            `${fund.name} ${fund.isin} ${fund.house} ${fund.sector} ${fund.assetClass} ${holdingText} ${fund.purchaseFee?.discountTitle || ''}`.toLowerCase()
-          const tokens = normalizedQuery.split(/\s+/).filter(Boolean)
-          if (!tokens.every((token) => haystack.includes(token))) return false
-        }
+      if (tokens.length) {
+        const haystack = fundDisplay(fund).searchText
+        if (!tokens.every((token) => haystack.includes(token))) continue
+      }
 
-        return true
-      })
-      .sort((a, b) => {
-        const result = compareValues(getSortValue(a, sort.key, viewMode, periodKey), getSortValue(b, sort.key, viewMode, periodKey), direction)
-        if (result !== 0) return result
-        return a.name.localeCompare(b.name, 'zh-Hans-CN')
-      })
-  }, [data, filters, periodKey, query, sort, viewMode])
+      rows.push({ fund, sortValue: getSortValue(fund, sort.key, viewMode, periodKey) })
+    }
 
-  const setFilter = (key, value) => {
+    // 排序值只算一次，比较时不再重复展开历史序列。
+    rows.sort((a, b) => {
+      const result = compareValues(a.sortValue, b.sortValue, direction)
+      if (result !== 0) return result
+      return a.fund.name.localeCompare(b.fund.name, 'zh-Hans-CN')
+    })
+
+    return rows.map((row) => row.fund)
+  }, [data, deferredQuery, filters, funds, periodKey, sort, viewMode])
+
+  const setFilter = useCallback((key, value) => {
     setFilters((current) => ({ ...current, [key]: value }))
-  }
+  }, [])
 
-  const handleSort = (key) => {
+  const handleSort = useCallback((key) => {
     setSort((current) => ({
       key,
       direction: current.key === key && current.direction === 'desc' ? 'asc' : 'desc',
     }))
-  }
+  }, [])
+
+  const openFund = useCallback((fundId) => {
+    setSelectedFundId(fundId)
+  }, [])
+
+  const closeFund = useCallback(() => {
+    setSelectedFundId(null)
+  }, [])
+
+  const showPortfolio = useCallback(() => {
+    setActiveTab('portfolio')
+    loadSeries()
+  }, [loadSeries])
 
   if (loadError) {
     return (
@@ -1878,7 +2107,7 @@ function App() {
               <button className={activeTab === 'funds' ? 'active' : ''} type="button" onClick={() => setActiveTab('funds')}>
                 基金筛选
               </button>
-              <button className={activeTab === 'portfolio' ? 'active' : ''} type="button" onClick={() => setActiveTab('portfolio')}>
+              <button className={activeTab === 'portfolio' ? 'active' : ''} type="button" onClick={showPortfolio}>
                 组合回测
               </button>
             </div>
@@ -1933,7 +2162,25 @@ function App() {
         </header>
 
         {activeTab === 'portfolio' ? (
-          <PortfolioBuilder data={data} onOpenFund={setSelectedFund} />
+          seriesReady ? (
+            <PortfolioBuilder funds={funds} series={series} onOpenFund={openFund} />
+          ) : (
+            <section className="portfolio-tool">
+              <div className="portfolio-pending">
+                <RefreshCw className="spin" size={20} />
+                <div>
+                  <h2>正在载入历史净值</h2>
+                  <p>{seriesError || '组合回测需要完整的历史净值，正在后台读取 funds-history.json。'}</p>
+                </div>
+                {seriesError ? (
+                  <button className="outline-button" type="button" onClick={loadSeries}>
+                    <RefreshCw size={15} />
+                    重试
+                  </button>
+                ) : null}
+              </div>
+            </section>
+          )
         ) : (
           <>
             <section className="filters">
@@ -2055,14 +2302,22 @@ function App() {
               periodKey={periodKey}
               sort={sort}
               onSort={handleSort}
-              onOpenFund={setSelectedFund}
+              onOpenFund={openFund}
             />
           </>
         )}
       </section>
 
       {selectedFund && (
-        <FundDrawer fund={selectedFund} onClose={() => setSelectedFund(null)} />
+        <FundDrawer
+          key={selectedFund.id}
+          fund={selectedFund}
+          series={series?.[selectedFund.id] || null}
+          seriesReady={seriesReady}
+          seriesError={seriesError}
+          onLoadSeries={loadSeries}
+          onClose={closeFund}
+        />
       )}
     </main>
   )
