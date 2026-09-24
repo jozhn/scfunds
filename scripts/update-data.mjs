@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, rm, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -20,7 +20,7 @@ const EASTMONEY_FUND_CODE_URL = 'https://fund.eastmoney.com/js/fundcode_search.j
 const SC_FEE_DISCOUNT_FACTOR = 0.1
 
 // 表格页面只需要指标和持仓，逐日净值占整体体积 85% 以上。
-// 因此把逐日序列拆到单独文件里按需加载，避免首屏解析几十 MB 的 JSON。
+// 因此把逐日序列按基金拆成单独文件，打开详情/回测时只取用到的那几只。
 const SERIES_FIELDS = [
   'historyLocal',
   'historyCny',
@@ -35,8 +35,19 @@ function tailPoints(series) {
   return series.slice(-RECENT_POINT_COUNT)
 }
 
+function seriesSlug(fund) {
+  const base = `${fund.isin || ''}-${fund.currencyCode || ''}`
+  const slug = base
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+
+  return slug || 'fund'
+}
+
 export function splitFundData(funds) {
-  const seriesById = {}
+  const seriesFiles = {}
+  const usedSlugs = new Set()
   const indexFunds = funds.map((fund) => {
     const indexFund = { ...fund }
     const series = {}
@@ -46,7 +57,17 @@ export function splitFundData(funds) {
       delete indexFund[field]
     }
 
-    seriesById[fund.id] = series
+    const baseSlug = seriesSlug(fund)
+    let slug = baseSlug
+    let suffix = 2
+    while (usedSlugs.has(slug)) {
+      slug = `${baseSlug}-${suffix}`
+      suffix += 1
+    }
+    usedSlugs.add(slug)
+
+    seriesFiles[slug] = { id: fund.id, ...series }
+    indexFund.seriesFile = `${slug}.json`
     indexFund.hasSeries = SERIES_FIELDS.some((field) => Boolean(series[field]?.length))
     indexFund.hasCnyHistory = Boolean(series.historyCny?.length)
     indexFund.recentLocal = tailPoints(series.historyLocal)
@@ -55,7 +76,23 @@ export function splitFundData(funds) {
     return indexFund
   })
 
-  return { indexFunds, seriesById }
+  return { indexFunds, seriesFiles }
+}
+
+export async function writeSeriesFiles(historyDir, seriesFiles, previousFiles = []) {
+  await mkdir(historyDir, { recursive: true })
+
+  const keep = new Set(Object.entries(seriesFiles).map(([slug]) => `${slug}.json`))
+  await Promise.all(
+    Object.entries(seriesFiles).map(([slug, series]) =>
+      writeFile(resolve(historyDir, `${slug}.json`), `${JSON.stringify(series)}\n`, 'utf8'),
+    ),
+  )
+
+  const stale = previousFiles.filter((file) => file.endsWith('.json') && !keep.has(file))
+  await Promise.all(stale.map((file) => rm(resolve(historyDir, file))))
+
+  return { written: keep.size, removed: stale.length }
 }
 
 const MANAGER_ALIASES = [
@@ -1688,23 +1725,18 @@ async function main() {
     recommendations,
   }
 
-  const { indexFunds, seriesById } = splitFundData(funds)
-
-  const indexOutput = { ...output, funds: indexFunds }
-  const seriesOutput = {
-    generatedAt: output.generatedAt,
-    range: output.range,
-    funds: seriesById,
-  }
+  const { indexFunds, seriesFiles } = splitFundData(funds)
 
   const indexPath = resolve(ROOT, 'public/data/funds.json')
-  const seriesPath = resolve(ROOT, 'public/data/funds-history.json')
+  const historyDir = resolve(ROOT, 'public/data/history')
 
-  await writeFile(indexPath, `${JSON.stringify(indexOutput)}\n`, 'utf8')
-  await writeFile(seriesPath, `${JSON.stringify(seriesOutput)}\n`, 'utf8')
+  const previousFiles = await readdir(historyDir).catch(() => [])
+  const { written, removed } = await writeSeriesFiles(historyDir, seriesFiles, previousFiles)
+
+  await writeFile(indexPath, `${JSON.stringify({ ...output, funds: indexFunds })}\n`, 'utf8')
 
   console.log(`Wrote ${indexPath}`)
-  console.log(`Wrote ${seriesPath}`)
+  console.log(`Wrote ${written} series files to ${historyDir}${removed ? `, removed ${removed} stale` : ''}`)
 }
 
 const isDirectRun = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href

@@ -38,24 +38,25 @@ import './App.css'
 
 const PERIOD_LABELS = Object.fromEntries(PERIODS.map((period) => [period.key, period.label]))
 const DEFAULT_PERIOD = '1y'
-const DATA_URL = `${import.meta.env.BASE_URL}data/funds.json`
-const SERIES_URL = `${import.meta.env.BASE_URL}data/funds-history.json`
+// 数据目录可以通过 VITE_DATA_BASE 指到自己的 CDN（需允许跨域），其余代码不用改。
+const DATA_BASE = (() => {
+  const base = import.meta.env.VITE_DATA_BASE || `${import.meta.env.BASE_URL}data/`
+  return base.endsWith('/') ? base : `${base}/`
+})()
+const INDEX_URL = `${DATA_BASE}funds.json`
+const SERIES_BASE = `${DATA_BASE}history/`
 const EMPTY_SERIES = []
 const EMPTY_FUNDS = []
 const EMPTY_TOKENS = []
+
+function seriesUrl(fund) {
+  return `${SERIES_BASE}${fund.seriesFile}`
+}
 
 function toFilterNumber(value) {
   if (value === '' || value === null || value === undefined) return null
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : null
-}
-
-// 省流模式或明显偏慢的网络下不主动预取 30MB 历史净值，改为真正需要时再加载。
-function canPrefetchSeries() {
-  const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection
-  if (!connection) return true
-  if (connection.saveData) return false
-  return !['slow-2g', '2g', '3g'].includes(connection.effectiveType)
 }
 
 const PERFORMANCE_CARD_PERIODS = [
@@ -98,7 +99,7 @@ function metricFor(fund, viewMode, periodKey) {
   return metrics?.intervals?.[periodKey] || null
 }
 
-// 表格只带最近若干天净值（recent*），完整历史由 funds-history.json 按需加载。
+// 表格只带最近若干天净值（recent*），完整历史按基金拆成独立文件按需加载。
 // 下面这些取值统一走“当前可用的序列”，两者都保持时间升序，热点路径不再排序或展开。
 function navSeriesFor(fund, viewMode) {
   const full = viewMode === 'cny' && fund.historyCny?.length ? fund.historyCny : fund.historyLocal
@@ -1317,25 +1318,41 @@ function PortfolioReturnChart({ points }) {
   )
 }
 
-function PortfolioBuilder({ funds: indexFunds, series, onOpenFund }) {
+function PortfolioBuilder({ funds: indexFunds, loadSeries, onOpenFund }) {
+  const [seriesMap, setSeriesMap] = useState({})
+  const [failedIds, setFailedIds] = useState({})
   const funds = useMemo(
-    () => indexFunds.map((fund) => (series?.[fund.id] ? { ...fund, ...series[fund.id] } : fund)),
-    [indexFunds, series],
+    () => indexFunds.map((fund) => (seriesMap[fund.id] ? { ...fund, ...seriesMap[fund.id] } : fund)),
+    [indexFunds, seriesMap],
   )
+  const fundsById = useMemo(() => new Map(funds.map((fund) => [fund.id, fund])), [funds])
   const fundOptions = useMemo(() => portfolioFundOptions(funds), [funds])
   // 400 多只基金 × 每行一个下拉，复用元素对象让 React 在行重渲染时跳过选项子树。
   const fundOptionElements = useMemo(
     () => fundOptions.map((option) => <option key={option.id} value={option.id}>{option.name}</option>),
     [fundOptions],
   )
-  const fundsById = useMemo(() => new Map(funds.map((fund) => [fund.id, fund])), [funds])
   const [rows, setRows] = useState([])
   const [startDate, setStartDate] = useState('')
+  const rowFundKey = rows.map((row) => row.fundId).join('|')
+  const missingFundIds = useMemo(() => {
+    const ids = new Set(rowFundKey ? rowFundKey.split('|') : [])
+
+    return [...ids].filter((id) => {
+      const fund = fundsById.get(id)
+      return fund?.hasSeries && fund.seriesFile && !seriesMap[id] && !failedIds[id]
+    })
+  }, [failedIds, fundsById, rowFundKey, seriesMap])
+  const failedFundIds = useMemo(
+    () => Object.keys(failedIds).filter((id) => fundsById.has(id)),
+    [failedIds, fundsById],
+  )
   const suggestedStart = useMemo(() => suggestedPortfolioStartDate(rows, fundsById), [fundsById, rows])
   const analysis = useMemo(() => buildPortfolioAnalysis(rows, fundsById, startDate), [fundsById, rows, startDate])
   const totalInputAmount = rows.reduce((sum, row) => sum + (Number(row.amount) || 0), 0)
   const analysisDays = daysBetween(analysis.startDate, analysis.endDate)
   const isCompactRange = Number.isFinite(analysisDays) && analysisDays < 270
+  const analysisPending = missingFundIds.length > 0
   const purchaseLimitIssues = rows
     .map((row) => purchaseLimitIssue(fundsById.get(row.fundId), row.amount))
     .filter(Boolean)
@@ -1344,6 +1361,41 @@ function PortfolioBuilder({ funds: indexFunds, series, onOpenFund }) {
     if (!funds.length || rows.length) return
     setRows(createDefaultPortfolioRows(funds))
   }, [funds, rows.length])
+
+  // 只拉组合里真正用到的基金历史，默认组合是 10 只小文件。
+  useEffect(() => {
+    if (!missingFundIds.length) return undefined
+
+    let active = true
+    Promise.all(
+      missingFundIds.map((id) =>
+        loadSeries(fundsById.get(id)).then((result) => [id, result]),
+      ),
+    ).then((loaded) => {
+      if (!active) return
+      const entries = loaded.filter(([, series]) => series)
+      if (entries.length) {
+        setSeriesMap((current) => {
+          const next = { ...current }
+          for (const [id, series] of entries) next[id] = series
+          return next
+        })
+      }
+
+      const failed = loaded.filter(([, series]) => !series).map(([id]) => id)
+      if (failed.length) {
+        setFailedIds((current) => {
+          const next = { ...current }
+          for (const id of failed) next[id] = true
+          return next
+        })
+      }
+    })
+
+    return () => {
+      active = false
+    }
+  }, [fundsById, loadSeries, missingFundIds])
 
   useEffect(() => {
     if (!suggestedStart || startDate) return
@@ -1405,6 +1457,15 @@ function PortfolioBuilder({ funds: indexFunds, series, onOpenFund }) {
         </div>
       ) : null}
 
+      {analysisPending ? (
+        <div className="portfolio-pending">
+          <RefreshCw className="spin" size={20} />
+          <div>
+            <h2>正在载入组合内基金的历史净值</h2>
+            <p>只加载组合里用到的 {missingFundIds.length} 只基金，每只约几十 KB。</p>
+          </div>
+        </div>
+      ) : (
       <div className={isCompactRange ? 'portfolio-visual compact' : 'portfolio-visual'}>
         <div className="portfolio-metrics">
           <MetricPill icon={PieChart} label="配置金额" value={`${currencyAmount(totalInputAmount)}元`} />
@@ -1417,6 +1478,7 @@ function PortfolioBuilder({ funds: indexFunds, series, onOpenFund }) {
 
         <PortfolioReturnChart points={analysis.returnSeries} />
       </div>
+      )}
 
       <div className="portfolio-body">
         <div className="portfolio-editor">
@@ -1466,6 +1528,17 @@ function PortfolioBuilder({ funds: indexFunds, series, onOpenFund }) {
             <h3>回测口径</h3>
             <span>{analysis.startDate || '-'} - {analysis.endDate || '-'}</span>
           </div>
+          {analysisPending ? (
+            <p className="portfolio-warning">历史净值载入中，完成后会自动计算回测结果。</p>
+          ) : null}
+          {!analysisPending && failedFundIds.length ? (
+            <p className="portfolio-warning">
+              {failedFundIds.length} 只基金的历史净值没能加载，已暂不计入曲线。
+              <button className="outline-button" type="button" onClick={() => setFailedIds({})}>
+                重新加载
+              </button>
+            </p>
+          ) : null}
           <dl className="detail-list">
             <dt>扣款金额</dt>
             <dd>{currencyAmount(analysis.totalAmount)} 元</dd>
@@ -1503,10 +1576,10 @@ function SummaryPanel({ data }) {
           <h1>基金筛选看板</h1>
         </div>
         <div className="summary-downloads">
-          <a className="icon-link" href={DATA_URL} download title="下载基金列表 JSON（指标、持仓、费率）">
+          <a className="icon-link" href={INDEX_URL} download title="下载基金列表 JSON（指标、持仓、费率）">
             <Download size={18} />
           </a>
-          <a className="icon-link" href={SERIES_URL} download title="下载历史净值 JSON（逐日曲线，约 32MB）">
+          <a className="icon-link" href={SERIES_BASE} download title="下载历史净值目录（每只基金一个 JSON）">
             <LineChart size={18} />
           </a>
         </div>
@@ -1689,7 +1762,10 @@ function PeriodMetrics({ fund, viewMode }) {
   )
 }
 
-function FundDrawer({ fund: indexFund, series, seriesReady, seriesError, onLoadSeries, onClose }) {
+function FundDrawer({ fund: indexFund, loadSeries, onClose }) {
+  const [series, setSeries] = useState(null)
+  const [seriesError, setSeriesError] = useState('')
+  const [reloadKey, setReloadKey] = useState(0)
   const fund = useMemo(() => (series ? { ...indexFund, ...series } : indexFund), [indexFund, series])
   const [periodKey, setPeriodKey] = useState(DEFAULT_PERIOD)
   const [viewMode, setViewMode] = useState(() =>
@@ -1707,11 +1783,22 @@ function FundDrawer({ fund: indexFund, series, seriesReady, seriesError, onLoadS
   const purchaseFee = fund.purchaseFee || {}
   const purchaseLimit = fund.purchaseLimit || {}
   const dailyReturn = packedDailyReturn(navSeries)
-  const seriesPending = !seriesReady && Boolean(indexFund.hasSeries)
 
   useEffect(() => {
-    onLoadSeries()
-  }, [onLoadSeries])
+    let active = true
+
+    loadSeries(indexFund).then((result) => {
+      if (!active) return
+      if (result) setSeries(result)
+      else setSeriesError('历史净值数据加载失败，请检查网络后重试')
+    })
+
+    return () => {
+      active = false
+    }
+  }, [indexFund, loadSeries, reloadKey])
+
+  const seriesPending = Boolean(indexFund.hasSeries) && !series
 
   return (
     <div className="drawer-backdrop" onClick={onClose}>
@@ -1798,7 +1885,14 @@ function FundDrawer({ fund: indexFund, series, seriesReady, seriesError, onLoadS
               <RefreshCw className={seriesError ? '' : 'spin'} size={16} />
               <span>{seriesError ? '历史净值暂不可用' : '正在载入历史净值…'}</span>
               {seriesError ? (
-                <button className="outline-button" type="button" onClick={onLoadSeries}>
+                <button
+                  className="outline-button"
+                  type="button"
+                  onClick={() => {
+                    setSeriesError('')
+                    setReloadKey((key) => key + 1)
+                  }}
+                >
                   重试
                 </button>
               ) : null}
@@ -1890,8 +1984,6 @@ function FundDrawer({ fund: indexFund, series, seriesReady, seriesError, onLoadS
 function App() {
   const [data, setData] = useState(null)
   const [loadError, setLoadError] = useState('')
-  const [series, setSeries] = useState(null)
-  const [seriesError, setSeriesError] = useState('')
   const [selectedFundId, setSelectedFundId] = useState(null)
   const [activeTab, setActiveTab] = useState('funds')
   const [query, setQuery] = useState('')
@@ -1913,10 +2005,10 @@ function App() {
     hideForeign: false,
   })
   const [sort, setSort] = useState({ key: 'annualized', direction: 'desc' })
-  const seriesRequestRef = useRef(null)
+  const seriesCacheRef = useRef(new Map())
 
   useEffect(() => {
-    fetch(DATA_URL)
+    fetch(INDEX_URL)
       .then((response) => {
         if (!response.ok) throw new Error('无法读取 public/data/funds.json，请先运行 npm run update-data')
         return response.json()
@@ -1925,42 +2017,31 @@ function App() {
       .catch((error) => setLoadError(error.message))
   }, [])
 
-  // 逐日净值单独成文件，首屏只解析轻量索引；打开详情或组合回测时再拉取完整序列。
-  const loadSeries = useCallback(() => {
-    if (!seriesRequestRef.current) {
-      seriesRequestRef.current = fetch(SERIES_URL)
-        .then((response) => {
-          if (!response.ok) throw new Error('无法读取 public/data/funds-history.json，请先运行 npm run update-data')
-          return response.json()
-        })
-        .then((payload) => {
-          setSeries(payload.funds || {})
-          setSeriesError('')
-          return payload.funds || {}
-        })
-        .catch((error) => {
-          setSeriesError('历史净值数据加载失败，请检查网络后重试')
-          console.error(error)
-          seriesRequestRef.current = null
-          return null
-        })
-    }
+  // 每只基金的逐日净值是独立文件，打开详情或回测时才按需取，结果按会话缓存。
+  const loadSeries = useCallback((fund) => {
+    if (!fund?.seriesFile || !fund?.hasSeries) return Promise.resolve(null)
 
-    return seriesRequestRef.current
+    const cache = seriesCacheRef.current
+    const cached = cache.get(fund.id)
+    if (cached) return cached
+
+    const request = fetch(seriesUrl(fund))
+      .then((response) => {
+        if (!response.ok) throw new Error(`无法读取 ${fund.seriesFile}`)
+        return response.json()
+      })
+      .then((payload) => {
+        return payload
+      })
+      .catch((error) => {
+        console.error(error)
+        cache.delete(fund.id)
+        return null
+      })
+
+    cache.set(fund.id, request)
+    return request
   }, [])
-
-  useEffect(() => {
-    if (!data) return undefined
-    if (!canPrefetchSeries()) return undefined
-
-    if (typeof window.requestIdleCallback === 'function') {
-      const handle = window.requestIdleCallback(() => loadSeries(), { timeout: 3000 })
-      return () => window.cancelIdleCallback(handle)
-    }
-
-    const timer = window.setTimeout(() => loadSeries(), 800)
-    return () => window.clearTimeout(timer)
-  }, [data, loadSeries])
 
   const funds = data ? data.funds : EMPTY_FUNDS
 
@@ -1968,8 +2049,6 @@ function App() {
     () => (selectedFundId ? funds.find((fund) => fund.id === selectedFundId) || null : null),
     [funds, selectedFundId],
   )
-
-  const seriesReady = Boolean(series)
 
   useEffect(() => {
     if (!selectedFund) return undefined
@@ -2070,10 +2149,6 @@ function App() {
     setSelectedFundId(null)
   }, [])
 
-  const showPortfolio = useCallback(() => {
-    setActiveTab('portfolio')
-    loadSeries()
-  }, [loadSeries])
 
   if (loadError) {
     return (
@@ -2107,7 +2182,7 @@ function App() {
               <button className={activeTab === 'funds' ? 'active' : ''} type="button" onClick={() => setActiveTab('funds')}>
                 基金筛选
               </button>
-              <button className={activeTab === 'portfolio' ? 'active' : ''} type="button" onClick={showPortfolio}>
+              <button className={activeTab === 'portfolio' ? 'active' : ''} type="button" onClick={() => setActiveTab('portfolio')}>
                 组合回测
               </button>
             </div>
@@ -2162,25 +2237,7 @@ function App() {
         </header>
 
         {activeTab === 'portfolio' ? (
-          seriesReady ? (
-            <PortfolioBuilder funds={funds} series={series} onOpenFund={openFund} />
-          ) : (
-            <section className="portfolio-tool">
-              <div className="portfolio-pending">
-                <RefreshCw className="spin" size={20} />
-                <div>
-                  <h2>正在载入历史净值</h2>
-                  <p>{seriesError || '组合回测需要完整的历史净值，正在后台读取 funds-history.json。'}</p>
-                </div>
-                {seriesError ? (
-                  <button className="outline-button" type="button" onClick={loadSeries}>
-                    <RefreshCw size={15} />
-                    重试
-                  </button>
-                ) : null}
-              </div>
-            </section>
-          )
+          <PortfolioBuilder funds={funds} loadSeries={loadSeries} onOpenFund={openFund} />
         ) : (
           <>
             <section className="filters">
@@ -2312,10 +2369,7 @@ function App() {
         <FundDrawer
           key={selectedFund.id}
           fund={selectedFund}
-          series={series?.[selectedFund.id] || null}
-          seriesReady={seriesReady}
-          seriesError={seriesError}
-          onLoadSeries={loadSeries}
+          loadSeries={loadSeries}
           onClose={closeFund}
         />
       )}
